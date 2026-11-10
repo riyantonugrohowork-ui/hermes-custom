@@ -1,0 +1,11 @@
+.venv/
+.git/
+.gitignore
+__pycache__/
+*.pyc
+data/
+output/
+logs/
+.env
+*.md
+.commandcode/

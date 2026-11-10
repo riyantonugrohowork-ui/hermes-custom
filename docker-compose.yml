@@ -1,0 +1,35 @@
+services:
+  hermes:
+    build: .
+    container_name: hermes-agent
+    restart: unless-stopped        # <-- kunci auto-start: Docker menyala ulang container bila mati
+    env_file: .env                 # <-- BW_SESSION, TELEGRAM_*, dsb dari .env
+    environment:
+      - TZ=Asia/Jakarta
+    secrets:
+      - bw_masterpass
+      - web_pass
+      - google_sa
+    ports:
+      - "10000:10000"
+    volumes:
+      - ./data:/app/data           # DB + auth cache
+      - ./output:/app/output       # dokumen Word/Excel hasil eksekusi
+      - ./logs:/app/logs           # log runtime
+      - ./data/bw-config:/root/.config/Bitwarden CLI   # simpan login Bitwarden antar-restart
+    healthcheck:
+      # Cek TCP murni — tidak butuh auth.
+      test: ["CMD", "python", "-c", "import socket; s=socket.create_connection(('localhost',10000),3); s.close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+# Docker secrets — lebih aman dari env var:
+# tidak muncul di `docker inspect` / `docker exec env`, dan file host bisa chmod 600.
+secrets:
+  bw_masterpass:
+    file: ./secrets/bw_masterpass
+  web_pass:
+    file: ./secrets/web_pass
+  google_sa:
+    file: ./secrets/google_sa.json

@@ -1,0 +1,22 @@
+# Secrets
+.env
+secrets/
+
+# Kredensial runtime — perlakukan seperti password.
+data/google_session.json
+data/bw-config/
+data/magang_seen.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# Hermes runtime
+data/*.sqlite
+output/
+logs/
+
+# Editor / OS
+.DS_Store
