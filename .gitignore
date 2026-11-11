@@ -3,7 +3,6 @@
 secrets/
 
 # Kredensial runtime — perlakukan seperti password.
-data/google_session.json
 data/bw-config/
 data/magang_seen.json
 

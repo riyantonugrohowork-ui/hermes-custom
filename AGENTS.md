@@ -32,6 +32,10 @@ hermes/
   recipe_ecuti.py     alur rekap E-Cuti (export → impor kepegawaian)
   recipe_penomoran.py alur penomoran surat cuti
   recipe_magang.py    pemantau pengajuan magang (portal izin)
+  recipe_duk.py       alur cetak DUK (SISDM → PDF → impor)
+  recipe_pegawai.py   alur data pegawai (SISDM → JSON → impor)
+  sisdm_pegawai.py    parser HTML SISDM (profil + riwayat, murni)
+  recipe_bersih.py    pembersih berkas lama di output/
   webui.py            dashboard (http.server bawaan, tanpa dependency)
   db.py               skema SQLite (notes, records, logs, recipe_state)
   tasks.py            model Task lama (instruksi + jadwal + Plan)
@@ -56,11 +60,17 @@ entri di situ + satu cabang di `recipes.execute()`.
 - **Jadwal:** `0 7 * * *` (harian 07:00)
 - **Input:** tanggal mulai/selesai + item Bitwarden (opsional; kosong = sebulan terakhir)
 - **Langkah:** login SIMPATIK (Bitwarden `2017skpd019`) → ambil token `/token?app=ecuti`
-  → export `dashboard/export_range` → Excel ke `output/ecuti/` → impor ke
-  kepegawaian lewat sesi Google tersimpan → urai hasil impor.
-- **Hasil impor dibaca dari `[role=status]`** di halaman kepegawaian, lalu diurai
-  `_urai_impor()` jadi `baru` / `diperbarui` / `dilewati` / `total`.
-- **Sesi Google:** `data/google_session.json` (dibuat sekali via `python -m hermes login-google`).
+  → export `dashboard/export_range` → Excel ke `output/ecuti/` → unggah ke
+  `POST /api/v1/impor-cuti` (multipart, `X-API-Key`, scope `impor`).
+- **Impor lewat API, bukan browser.** Endpoint memakai service yang sama dengan
+  halaman panel, jadi aturan upsert/pelewatan barisnya identik dan tidak ada
+  lagi sesi Google/Playwright yang perlu dirawat.
+- **Respons API** `{inserted, updated, skipped, tanpa_surat, status_lain,
+  jumlah_diproses}` dipetakan `recipe_ecuti` ke `baru` / `diperbarui` /
+  `dilewati` / `total` supaya `summarize()` tetap bekerja.
+- **`jumlah_diproses` tidak mencakup baris yang dilewati** karena No Surat
+  kosong atau status bukan TTE Kepala Dinas — `total` dihitung manual dari
+  `inserted + updated + jumlah_dilewati`.
 
 ### `penomoran_cuti` — Penomoran Surat Cuti
 - **Jadwal:** `0 */2 * * *` (tiap 2 jam)
@@ -88,6 +98,61 @@ entri di situ + satu cabang di `recipes.execute()`.
 - **Kredensial:** Bitwarden item `izin.semarangkota.go.id`, user `riyantoSimonev`.
 - **State "sudah dilihat":** `data/magang_seen.json` (lihat bagian State).
 
+### `duk_mingguan` — Impor DUK
+- **Jadwal:** `0 7 * * 1` (Senin 07:00, mingguan)
+- **Input:** tidak ada — satu tombol saja.
+- **Langkah:** login SIMPATIK → `token?app=sisdm` → buka
+  `https://sisdm.semarangkota.go.id/duk` → `page.pdf()` (A4 lanskap,
+  `print_background`) → `POST /api/v1/impor-duk`.
+- **PDF hasil:** `output/duk/DUK-YYYY-MM-DD.pdf`, ikut bind-mount `./output`,
+  jadi tersimpan permanen di host (bukan temporary container).
+- **Halaman `/duk` tanpa form/filter** — murni dokumen cetak. Periode kosong
+  dan yang tercetak adalah DUK berjalan saat resep dijalankan.
+- **Text layer wajib:** PDF dibuat Chromium dari HTML (bukan scan), jadi
+  `pdftotext` di sisi kepegawaian bisa mengekstraknya. Terbukti 33 baris dari
+  3 halaman.
+- **PDF terlalu kecil (< 1 KB) dianggap gagal** dan tidak diunggah.
+
+### `pegawai_harian` — Data Pegawai Aktif
+- **Jadwal:** `0 7 * * 5` (Jumat 07:00, mingguan)
+- **Input:** `kd_skpd` (kode OPD, opsional; kosong = `019`)
+- **Langkah:** login SIMPATIK → `token?app=sisdm` → `/pegawai` → pilih
+  `#kd_skpd` → klik `#btn-filter` → `#pegawai-table_length` = `All` →
+  ambil baris `Kedudukan = Aktif` → ekstrak profil + seluruh riwayat →
+  `POST /api/v1/impor-pegawai`.
+- **Hasil:** `output/pegawai/data_pegawai_aktif_YYYY-MM-DD.json` (bind-mount,
+  permanen di host). 57 pegawai aktif ≈ 550 detik.
+- **OPD dipilih lewat kode, bukan nama** — `kd_skpd` `019` =
+  Dinas Penanaman Modal dan Pelayanan Terpadu Satu Pintu. Nama OPD bisa
+  berubah penulisannya, kode tidak.
+- **"Aktif" bukan satu-satunya isi tabel.** Data nyata: 80 pegawai, 57 Aktif,
+  19 Pensiun, 2 Pemberhentian, 1 Tugas Belajar, 1 Meninggal. Menyaring
+  status wajib; kalau tidak, 23 pegawai nonaktif ikut terkirim.
+- **`PPPK` tidak muncul sebagai kata "PPPK" di SISDM.** Statusnya ditulis
+  lengkap `PEGAWAI PEMERINTAH DENGAN PERJANJIAN KERJA` (dan `... PARUH WAKTU`).
+  Deteksi harus mencocokkan `PERJANJIAN KERJA`, bukan `PPPK` — kalau salah,
+  riwayat PPPK tidak terambil dan KGB/pangkat yang seharusnya kosong justru
+  ikut terambil.
+- **Ambil halaman via `ctx.request`, bukan `page.goto`.** 57 pegawai ×
+  ~11 halaman = ribuan request; `page.goto` akan memuat CSS/JS tiap kali.
+- **Kompetensi & CPNS/PPPK butuh form edit.** Tabel daftar tidak memuat
+  tanggal pelaksanaan, jumlah jam, atau gaji — datanya hanya ada di
+  `/riwayat_*/{id}/edit`.
+- **Impor bertahap 100 record** (`BATCH_IMPOR`); API menolak > 2000.
+- **Notifikasi diringkas** (jumlah + PNS/PPPK), log nama tidak ikut dikirim.
+
+### `bersih_output` — Bersihkan Berkas Unduhan
+- **Jadwal:** `0 23 * * 0` (Minggu 23:00, mingguan)
+- **Input:** `retensi` (hari, opsional; kosong = `HERMES_OUTPUT_RETENSI_HARI`)
+- **Langkah:** pindai `output/` rekursif → hapus berkas yang `mtime`-nya lebih
+  tua dari batas → laporkan. Folder tidak dihapus, hanya berkas.
+- **Retensi default 7 hari.** Berkas baru tidak pernah disentuh, jadi hasil
+  hari itu aman.
+- **Pengaman:** setiap berkas diverifikasi berada di bawah `output/`
+  (`Path.resolve().relative_to()`), supaya symlink ke luar folder tidak ikut
+  terhapus. Nilai retensi tak sah (`0`, negatif, bukan angka) kembali ke default.
+- **Gate notifikasi:** hanya kirim kalau ada berkas yang benar-benar dihapus.
+
 ---
 
 ## Notifikasi Telegram
@@ -105,6 +170,9 @@ jalur exception, agar kegagalan tidak senyap.
 | Rekap menghasilkan Excel | ✅ |
 | Magang ada pengajuan baru | ✅ |
 | Magang 0 baru | ❌ diam |
+| DUK tersimpan (batch baru) | ✅ |
+| Pegawai terimpor | ✅ (resume: jumlah + PNS/PPPK) |
+| Pembersihan 0 berkas | ❌ diam |
 
 Penomoran jalan 12× sehari — tanpa gate ini akan jadi noise.
 
@@ -163,11 +231,12 @@ Auto-refresh 15 detik hanya saat tab Dashboard aktif.
 |---|---|
 | `data/hermes.sqlite` | DB utama: `notes`, `records`, `logs`, `recipe_state` |
 | `data/magang_seen.json` | kode `MGNG-*` yang sudah dilaporkan |
-| `data/google_session.json` | sesi login kepegawaian (perlakukan seperti kredensial) |
 | `data/bw-config/` | config & login Bitwarden antar-restart |
-| `output/ecuti/` | Excel hasil export + screenshot impor |
+| `output/ecuti/` | Excel hasil export |
+| `output/duk/` | PDF DUK hasil cetak |
+| `output/pegawai/` | JSON data pegawai aktif |
 
-**Jangan pernah** commit atau echo isi `.env`, `secrets/`, `data/google_session.json`.
+**Jangan pernah** commit atau echo isi `.env` dan `secrets/`.
 
 ---
 
@@ -181,6 +250,7 @@ TELEGRAM_BOT_TOKEN                     token bot
 TELEGRAM_ALLOWED_CHAT_IDS              daftar chat id (diparse jadi int!)
 TELEGRAM_NOTIFY                        kill switch (0 = mati)
 PENOMORAN_MAX_HALAMAN                  default 3
+HERMES_OUTPUT_RETENSI_HARI             default 7 (resep bersih_output)
 KEPEG_API_KEY / GOOGLE_SHEET_ID        akses API & register
 BW_EMAIL                               untuk `bw login` di entrypoint
 HERMES_DAILY_DELAY                     jeda startup autopilot (detik)
@@ -196,7 +266,6 @@ python -m hermes recipe run <key>   # jalankan satu alur
 python -m hermes tick               # periksa jadwal sekali
 python -m hermes autopilot          # daemon otonom
 python -m hermes web                # dashboard
-python -m hermes login-google       # login kepegawaian sekali
 ```
 
 **Deploy perubahan:**

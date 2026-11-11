@@ -3,8 +3,7 @@
 Alur tetap (bukan ditebak LLM) karena melibatkan:
   - CSRF dinamis (harus diambil live tiap kali)
   - download file Excel
-  - upload Livewire/FilePond (bukan form POST biasa)
-  - OAuth Google dengan sesi tersimpan
+  - unggah berkas ke API impor (multipart, X-API-Key)
 
 Pemakaian (dipicu dari chat):
   "ambil rekap e-cuti"
@@ -15,8 +14,7 @@ from __future__ import annotations
 import calendar
 import json
 import os
-import re
-from datetime import date, timedelta
+from datetime import date
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -27,10 +25,6 @@ if TYPE_CHECKING:
 SIMPATIK_LOGIN = "https://simpatik.semarangkota.go.id/login"
 SIMPATIK_TOKEN = "http://simpatik.semarangkota.go.id/token?app=ecuti"
 ECUTI_EXPORT_PAGE = "https://e-cuti.semarangkota.go.id/administrator/dashboard/export_range"
-KEPEG_IMPORT = "https://kepegawaian.it-dpmptsp.my.id/kepegawaian/impor-cuti"
-
-# Sesi Google kepegawaian (login manual sekali, dipakai ulang).
-GOOGLE_STATE_FILE = "google_session.json"
 
 # Format tanggal datepicker (sesuai form E-Cuti).
 DATE_FMT = "%Y-%m-%d"  # SIMPATIK memakai format yyyy-mm-dd
@@ -49,16 +43,6 @@ def date_range(tgl_mulai: str = "", tgl_selesai: str = "") -> tuple[str, str]:
     start = tgl_mulai or default_start.strftime(DATE_FMT)
     end = tgl_selesai or today.strftime(DATE_FMT)
     return start, end
-
-
-def storage_dir(cfg: "Config") -> Path:
-    d = cfg.db_path.parent
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-def google_state_path(cfg: "Config") -> Path:
-    return storage_dir(cfg) / GOOGLE_STATE_FILE
 
 
 def bitwarden_login(cfg: "Config", item: str, username: str = "") -> tuple[str, str] | None:
@@ -123,7 +107,7 @@ LAUNCH_ARGS = [
 ]
 
 
-def _new_context(browser, storage_state: str | None = None):
+def _new_context(browser):
     """Context dengan fingerprint realistis agar lolos WAF."""
     ctx = browser.new_context(
         accept_downloads=True,
@@ -131,7 +115,6 @@ def _new_context(browser, storage_state: str | None = None):
         locale="id-ID",
         viewport={"width": 1366, "height": 768},
         extra_http_headers={"Accept-Language": "id-ID,id;q=0.9,en;q=0.8"},
-        storage_state=storage_state,
     )
     ctx.add_init_script(
         "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
@@ -175,89 +158,18 @@ def _download_export(page, tgl_mulai: str, tgl_selesai: str, out_dir: Path) -> s
     return path
 
 
-def _urai_impor(teks: str) -> dict:
-    """Urai teks hasil impor jadi angka.
+def _import_kepegawaian(cfg: "Config", xlsx_path: str) -> dict:
+    """Unggah Excel ke API impor-cuti kepegawaian (multipart, scope `impor`).
 
-    Contoh: 'Impor selesai. 0 data baru, 27 diperbarui. 1 baris dilewati
-    (No. Surat kosong). 3 baris dilewati (status bukan "TTE Kepala Dinas").'
+    Dulu tahap ini meniru halaman Filament lewat Playwright + sesi Google.
+    API-nya memakai service impor yang sama, jadi aturan upsert, pelewatan
+    baris, dan hitungan hasilnya identik — tanpa browser dan tanpa sesi.
     """
-    bersih = re.sub(r"\s+", " ", (teks or "")).strip()
-    hasil: dict = {"teks": bersih}
+    from . import kepeg
 
-    m = re.search(r"(\d+)\s+data\s+baru", bersih)
-    if m:
-        hasil["baru"] = int(m.group(1))
-    m = re.search(r"(\d+)\s+diperbarui", bersih)
-    if m:
-        hasil["diperbarui"] = int(m.group(1))
-
-    lewat = [
-        {"jumlah": int(n), "alasan": re.sub(r"\s+", " ", ket).strip(" .")}
-        for n, ket in re.findall(r"(\d+)\s+baris\s+dilewati\s*\(([^)]*)\)", bersih)
-    ]
-    if lewat:
-        hasil["dilewati"] = lewat
-        hasil["jumlah_dilewati"] = sum(x["jumlah"] for x in lewat)
-
-    baru = hasil.get("baru")
-    diperbarui = hasil.get("diperbarui")
-    if baru is not None and diperbarui is not None:
-        hasil["total"] = baru + diperbarui + hasil.get("jumlah_dilewati", 0)
+    hasil = kepeg.impor_cuti(cfg, xlsx_path)
+    hasil["note"] = "Impor selesai."
     return hasil
-
-
-def _import_kepegawaian(context, cfg: "Config", xlsx_path: str) -> dict:
-    """Buka impor-cuti → upload Excel via FilePond → klik Mulai Impor."""
-    out_dir = cfg.output_dir / "ecuti"
-    page = context.new_page()
-    page.set_default_timeout(30000)
-    page.goto(KEPEG_IMPORT, wait_until="domcontentloaded")
-    page.wait_for_selector("form.fi-form", timeout=30000)
-
-    # FilePond dirender via JS — input file-nya tersembunyi, jadi tunggu "attached".
-    try:
-        page.wait_for_selector("input.filepond--browser", state="attached", timeout=30000)
-    except Exception:  # noqa: BLE001
-        return {"ok": False, "error": "FilePond input tidak muncul (halaman impor tak termuat?)."}
-
-    page.set_input_files("input.filepond--browser", xlsx_path)
-
-    # Tunggu unggahan selesai: FilePond menandai item, atau indikator hilang.
-    page.wait_for_timeout(5000)
-
-    # Klik tombol "Mulai Impor".
-    clicked = False
-    for sel in ("button.fi-btn[type=submit]", "button:has-text('Mulai Impor')"):
-        try:
-            el = page.query_selector(sel)
-            if el:
-                el.click()
-                clicked = True
-                break
-        except Exception:  # noqa: BLE001
-            continue
-    if not clicked:
-        return {"ok": False, "error": "Tombol 'Mulai Impor' tidak ditemukan."}
-
-    # Tunggu toast hasil impor muncul (bukan sekadar timer).
-    teks_impor = ""
-    for _ in range(20):
-        el = page.query_selector("[role=status]") or page.query_selector(".fi-no-notification")
-        if el:
-            teks_impor = (el.inner_text() or "").strip()
-            if "Impor" in teks_impor:
-                break
-        page.wait_for_timeout(1000)
-
-    try:
-        page.screenshot(path=str(out_dir / "import_result.png"), full_page=True)
-    except Exception:  # noqa: BLE001
-        pass
-
-    hasil = _urai_impor(teks_impor)
-    if not teks_impor:
-        return {"ok": True, "note": "Impor dikirim (hasil tidak terbaca)."}
-    return {"ok": True, "note": "Impor selesai.", **hasil}
 
 
 # ---------- Orkestrator ----------
@@ -265,7 +177,6 @@ def _import_kepegawaian(context, cfg: "Config", xlsx_path: str) -> dict:
 def run_ecuti(
     cfg: "Config",
     bw_item: str = "2017skpd019",
-    google_email: str = "",
     tgl_mulai: str = "",
     tgl_selesai: str = "",
 ) -> dict:
@@ -360,27 +271,17 @@ def run_ecuti(
             log.append(f"Excel terunduh: {Path(xlsx).name}")
             ctx1.close()
 
-            # ===== Tahap 4–5: kepegawaian (sesi Google) → impor =====
-            sp = google_state_path(cfg)
-            if not sp.is_file():
-                browser.close()
+            # ===== Tahap 4–5: impor ke kepegawaian lewat API =====
+            try:
+                imp = _import_kepegawaian(cfg, xlsx)
+            except Exception as e:  # noqa: BLE001
                 return {
-                    "ok": True,
-                    "step": "export_only",
+                    "ok": False,
+                    "step": "import",
+                    "error": f"{type(e).__name__}: {e}",
                     "xlsx": xlsx,
-                    "range": f"{tgl_mulai} s/d {tgl_selesai}",
                     "log": log,
-                    "warning": (
-                        "Export berhasil, TAPI impor belum jalan: sesi Google kepegawaian "
-                        f"belum ada. Jalankan `python -m hermes login-google` sekali untuk akun "
-                        f"{google_email or 'kepegawaian'}, lalu ulangi untuk impor."
-                    ),
                 }
-            ctx2 = _new_context(browser, storage_state=str(sp))
-            imp = _import_kepegawaian(ctx2, cfg, xlsx)
-            ctx2.close()
-            if not imp.get("ok"):
-                return {"ok": False, "step": "import", "error": imp.get("error"), "xlsx": xlsx, "log": log}
             log.append(imp.get("note") or "Impor dikirim ke kepegawaian")
             browser.close()
 
@@ -391,10 +292,24 @@ def run_ecuti(
             "range": f"{tgl_mulai} s/d {tgl_selesai}",
             "log": log,
         }
-        # Angka hasil impor (data baru/diperbarui/dilewati) untuk ringkasan.
-        for k in ("baru", "diperbarui", "dilewati", "jumlah_dilewati", "total", "teks"):
-            if imp.get(k) is not None:
-                hasil[k] = imp[k]
+        # Terjemahkan hasil API impor ke kunci yang dipakai summarize().
+        hasil["baru"] = imp.get("inserted", 0)
+        hasil["diperbarui"] = imp.get("updated", 0)
+        dilewati = []
+        if imp.get("skipped"):
+            dilewati.append({"jumlah": imp["skipped"], "alasan": "pernah diedit manual"})
+        if imp.get("tanpa_surat"):
+            dilewati.append({"jumlah": imp["tanpa_surat"], "alasan": "No. Surat kosong"})
+        if imp.get("status_lain"):
+            dilewati.append({"jumlah": imp["status_lain"], "alasan": "status bukan TTE Kepala Dinas"})
+        if dilewati:
+            hasil["dilewati"] = dilewati
+            hasil["jumlah_dilewati"] = sum(d["jumlah"] for d in dilewati)
+        # jumlah_diproses hanya menghitung inserted+updated+skipped, jadi
+        # baris yang dilewati karena tanpa surat/status lain ditambah sendiri.
+        hasil["total"] = (
+            hasil["baru"] + hasil["diperbarui"] + hasil.get("jumlah_dilewati", 0)
+        )
         return hasil
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "step": "unknown", "error": f"{type(e).__name__}: {e}", "log": log}

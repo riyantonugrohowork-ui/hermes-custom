@@ -323,7 +323,7 @@ async function loadDash(){
   $('#health').innerHTML = [
     ['Mode', d.autonomous ? 'otonom (jadwal aktif)' : 'manual'],
     ['Alur terjadwal', d.stats.scheduled],
-    ['Sesi Google kepegawaian', d.google_session ? '✅ tersimpan' : '— belum ada'],
+    ['API kepegawaian', d.kepeg_api ? '✅ terpasang' : '— belum ada'],
     ['Log total', d.logs.total],
     ['Error log', d.logs.by_level.error||0],
   ].map(([k,v]) => `<tr><td style="color:var(--dim)">${k}</td>
@@ -598,7 +598,7 @@ def _dashboard(state: _State) -> dict:
             "logs": db.log_stats(conn),
             "notifications": _notifications(conn, limit=30),
             "autonomous": any(r["schedule"] for r in items),
-            "google_session": _google_session_exists(cfg),
+            "kepeg_api": _kepeg_api_ready(cfg),
         }
     finally:
         conn.close()
@@ -622,13 +622,9 @@ def _notifications(conn: sqlite3.Connection, limit: int = 100) -> list[dict]:
     return hasil
 
 
-def _google_session_exists(cfg: "Config") -> bool:
-    try:
-        from . import recipe_ecuti
-
-        return recipe_ecuti.google_state_path(cfg).is_file()
-    except Exception:  # noqa: BLE001
-        return False
+def _kepeg_api_ready(cfg: "Config") -> bool:
+    """Impor ke kepegawaian kini lewat API — cukup ada kunci API."""
+    return bool(cfg.kepeg_api_key)
 
 
 class Handler(BaseHTTPRequestHandler):

@@ -142,6 +142,66 @@ def generate(
     return r.json()
 
 
+def impor_cuti(cfg: "Config", path: str) -> dict:
+    """Unggah rekap Excel ke tabel cuti (upsert per no_surat).
+
+    Memakai service impor yang sama dengan halaman panel, jadi aturan
+    upsert/pelewatan barisnya identik. Impor sukses juga menandai
+    "impor cuti hari ini" sehingga gerbang Generator Surat Cuti terbuka.
+    """
+    import requests
+
+    with open(path, "rb") as fh:
+        r = requests.post(
+            f"{_base(cfg)}/impor-cuti",
+            headers={"X-API-Key": _key(cfg)},
+            files={"file": (os.path.basename(path), fh, "application/vnd.ms-excel")},
+            timeout=180,
+        )
+    if r.status_code >= 400:
+        raise RuntimeError(f"API impor {r.status_code}: {_pesan(r)}")
+    return r.json()
+
+
+def impor_duk(cfg: "Config", path: str, sumber_label: str = "hermes-duk-v1") -> dict:
+    """Unggah PDF DUK ke tabel duk (batch baru; batch lama tidak dihapus).
+
+    PDF wajib punya text layer — server mengekstraknya dengan pdftotext.
+    """
+    import requests
+
+    with open(path, "rb") as fh:
+        r = requests.post(
+            f"{_base(cfg)}/impor-duk",
+            headers={"X-API-Key": _key(cfg)},
+            files={"file": (os.path.basename(path), fh, "application/pdf")},
+            data={"sumber_label": sumber_label},
+            timeout=300,
+        )
+    if r.status_code >= 400:
+        raise RuntimeError(f"API impor-duk {r.status_code}: {_pesan(r)}")
+    return r.json()
+
+
+def impor_pegawai(cfg: "Config", records: list[dict]) -> dict:
+    """Kirim data pegawai (hasil scrape SISDM) ke `POST /api/v1/impor-pegawai`.
+
+    Tiap record adalah snapshot penuh: riwayat anak, kompetensi, jabatan,
+    pangkat, dan KGB untuk NIP itu diganti seluruhnya di sisi kepegawaian.
+    """
+    import requests
+
+    r = requests.post(
+        f"{_base(cfg)}/impor-pegawai",
+        headers={"X-API-Key": _key(cfg), "Content-Type": "application/json"},
+        json={"records": records},
+        timeout=300,
+    )
+    if r.status_code >= 400:
+        raise RuntimeError(f"API impor-pegawai {r.status_code}: {_pesan(r)}")
+    return r.json()
+
+
 def sisa_urut(sisa: dict | None, tahun: int | None = None) -> tuple[int, int, int]:
     """(N, N-1, N-2) dari dict sisa cuti per tahun."""
     sisa = sisa or {}

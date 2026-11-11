@@ -16,7 +16,7 @@ fi
 if [ -n "$MP" ]; then
   # Cek status akun bw: belum login perlu `bw login` dulu.
   # Semua perintah diberi timeout agar tidak menggantung & memblokir web UI.
-  STATUS=$(timeout 15 bw status --nointeraction 2>/dev/null | grep -o '"status":"[^"]*"' | cut -d'"' -f4)
+  STATUS=$(timeout 15 bw status --nointeraction 2>/dev/null | grep -o '"status":"[^"]*"' | cut -d'"' -f4) || STATUS=""
 
   if [ "$STATUS" = "unauthenticated" ] || [ -z "$STATUS" ]; then
     if [ -n "$BW_EMAIL" ]; then
@@ -32,7 +32,7 @@ if [ -n "$MP" ]; then
   fi
 
   echo "🔐 Membuka vault Bitwarden otomatis..."
-  SESSION=$(timeout 30 env BW_PASSWORD="$MP" bw unlock --passwordenv BW_PASSWORD --raw 2>/dev/null)
+  SESSION=$(timeout 30 env BW_PASSWORD="$MP" bw unlock --passwordenv BW_PASSWORD --raw 2>/dev/null) || SESSION=""
   if [ -n "$SESSION" ]; then
     export BW_SESSION="$SESSION"
     echo "✅ Vault terbuka (session baru dihasilkan)."

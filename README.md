@@ -70,7 +70,6 @@ python -m hermes recipe run ecuti_rekap tanggal_mulai=2026-11-01
 python -m hermes autopilot          # daemon otonom (jadwal + startup)
 python -m hermes tick               # periksa jadwal sekali (untuk cron sistem)
 python -m hermes web                # dashboard di http://localhost:10000
-python -m hermes login-google       # login Google sekali (simpan sesi)
 ```
 
 Perintahnya lain yang masih ada untuk debugging: `status`, `run "instruksi"`, `plan`, `tasks`, `chat`, `telegram`.

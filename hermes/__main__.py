@@ -7,8 +7,6 @@ Pakai:
   python -m hermes telegram        # jalankan bot Telegram (long-polling)
   python -m hermes schedule        # jalankan scheduler task berjadwal
   python -m hermes web             # buka antarmuka web (localhost:10000)
-  python -m hermes login-google    # login Google sekali (simpan sesi e-cuti)
-  python -m hermes login-google --cdp http://<ip>:9222   # via Edge asli (anti-blokir Google)
   python -m hermes autopilot       # jalankan e-cuti otomatis (start + harian)
   python -m hermes tasks           # daftar task
 """
@@ -187,96 +185,6 @@ def cmd_plan(cfg, instruction: str) -> int:
     return 0
 
 
-def cmd_login_google(cfg, recipe_ecuti, cdp_url: str | None = None) -> int:
-    """Login Google kepegawaian sekali; simpan sesi.
-
-    Dua mode:
-      - default   : buka Chromium Playwright (sering DIBLOKIR Google).
-      - --cdp URL : sambung ke Edge/Chrome ASLI yang sudah berjalan dengan
-                    --remote-debugging-port (tidak diblokir Google).
-    """
-    import time
-
-    from playwright.sync_api import sync_playwright
-
-    sp = recipe_ecuti.google_state_path(cfg)
-    target = "https://kepegawaian.it-dpmptsp.my.id/login"
-    print("=" * 60)
-    print("MODE LOGIN GOOGLE KEPEGAWAIAN (sekali saja)")
-    print("=" * 60)
-    if cdp_url:
-        print(f"Mode CDP: menyambung ke browser asli di {cdp_url}")
-    else:
-        print("Mode Chromium Playwright — Google SERING memblokir ini.")
-        print("Jika muncul 'browser may not be secure', pakai mode --cdp (lihat bawah).")
-    print("Akun: riyantonugroho.work@gmail.com")
-    print("Setelah masuk aplikasi, sesi tersimpan OTOMATIS. (Maks 5 menit)")
-    try:
-        with sync_playwright() as p:
-            if cdp_url:
-                browser = p.chromium.connect_over_cdp(cdp_url)
-                ctx = browser.contexts[0] if browser.contexts else browser.new_context()
-                page = ctx.new_page()
-            else:
-                browser = p.chromium.launch(headless=False, args=["--start-maximized"])
-                ctx = browser.new_context(no_viewport=True)
-                page = ctx.new_page()
-            page.goto(target, wait_until="domcontentloaded")
-
-            # Langsung arahkan ke halaman sign-in Google bila ada tombolnya.
-            try:
-                btn = page.get_by_text("Login via Google", exact=False).first
-                if btn.count() > 0:
-                    btn.click(timeout=5000)
-            except Exception:  # noqa: BLE001
-                pass
-
-            ok = False
-            for _ in range(300):  # 5 menit
-                try:
-                    url = page.url
-                except Exception:  # noqa: BLE001
-                    print("\n❌ Jendela browser ditutup sebelum login selesai.")
-                    return 1
-                # Berhasil bila sudah di aplikasi kepegawaian, bukan halaman login/Google.
-                if (
-                    "kepegawaian.it-dpmptsp.my.id" in url
-                    and "/login" not in url
-                    and "accounts.google.com" not in url
-                ):
-                    ok = True
-                    break
-                time.sleep(1)
-
-            if not ok:
-                print("\n⌛ Waktu habis — belum terdeteksi masuk ke aplikasi. Coba lagi.")
-                if not cdp_url:
-                    browser.close()
-                return 1
-
-            page.wait_for_timeout(1500)  # beri waktu cookie sesi tersimpan
-            sp.parent.mkdir(parents=True, exist_ok=True)
-            ctx.storage_state(path=str(sp))
-            print(f"\n✅ Login terdeteksi. Sesi tersimpan: {sp}")
-            # Mode CDP: jangan tutup Edge milik user, cukup lepaskan koneksi.
-            if not cdp_url:
-                browser.close()
-        return 0
-    except KeyboardInterrupt:
-        print("\nDibatalkan.")
-        return 1
-    except Exception as e:  # noqa: BLE001
-        msg = str(e)
-        if "XServer" in msg or "DISPLAY" in msg or "headed" in msg.lower():
-            print("\n❌ Tidak ada tampilan grafis (DISPLAY) — browser tak bisa dibuka.")
-            print("   Jalankan perintah ini di mesin dengan layar (bukan container headless),")
-            print("   lalu salin file sesi ke mesin Hermes:")
-            print("   data/google_session.json")
-        else:
-            print(f"\n❌ Gagal: {type(e).__name__}: {msg[:200]}")
-        return 1
-
-
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     cfg = config.get_config()
@@ -332,14 +240,6 @@ def main(argv: list[str] | None = None) -> int:
 
         autopilot.loop(cfg)
         return 0
-    if cmd == "login-google":
-        from . import recipe_ecuti
-
-        cdp = None
-        if "--cdp" in rest:
-            i = rest.index("--cdp")
-            cdp = rest[i + 1] if i + 1 < len(rest) else None
-        return cmd_login_google(cfg, recipe_ecuti, cdp_url=cdp)
 
     print(f"Perintah tidak dikenal: {cmd}\n")
     print(__doc__)

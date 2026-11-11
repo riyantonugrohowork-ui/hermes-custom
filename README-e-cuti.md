@@ -6,17 +6,19 @@ Panduan menjalankan **template alur e-cuti** yang sudah terpasang di Hermes.
 
 ## Apa yang dilakukan alur ini
 
-Satu perintah → lima tahap otomatis:
+Satu perintah → empat tahap otomatis:
 
 | # | Tahap | Detail |
 |---|---|---|
 | 1 | Login SIMPATIK | `simpatik.semarangkota.go.id/login` — kredensial dari Bitwarden item `2017skpd019` |
 | 2 | Ambil token | `/token?app=ecuti` → redirect ke portal e-cuti |
 | 3 | Export rekap | `dashboard/export_range` — isi tanggal (hari ini −1 bulan s/d hari ini) → Save → Excel terunduh |
-| 4 | Buka kepegawaian | Sesi Google tersimpan (tanpa login ulang) |
-| 5 | Impor cuti | `kepegawaian/impor-cuti` → upload Excel → Mulai Impor |
+| 4 | Impor cuti | `POST /api/v1/impor-cuti` → unggah Excel (multipart, `X-API-Key`) |
 
-Hasil Excel: `output/ecuti/<nama-file>.xlsx`
+Hasil Excel: `output/ecuti/<nama-file>.xls`
+
+> Tahap impor memakai **API**, bukan browser. Tidak ada lagi sesi Google,
+> FilePond, atau screenshot hasil impor yang perlu dirawat.
 
 ---
 
@@ -26,10 +28,17 @@ Hasil Excel: `output/ecuti/<nama-file>.xlsx`
 Item `2017skpd019` harus ada di vault dan berisi **username + password** SIMPATIK.
 
 ```bash
-cd /root/docker/hermes
+cd /home/dpmptsp/docker/hermes-custom
 echo -n "MASTER-PASSWORD-VAULT-ANDA" > secrets/bw_masterpass
 chmod 600 secrets/bw_masterpass
 docker compose up -d --no-build --force-recreate
+```
+
+Login Bitwarden sekali bila container belum pernah login (config tersimpan di
+`data/bw-config/`, jadi bertahan antar-restart):
+
+```bash
+docker exec -it hermes-agent bw login    # email → password → OTP
 ```
 
 Cek berhasil:
@@ -38,59 +47,64 @@ docker compose logs --tail=5
 # harus muncul: ✅ Vault terbuka (session baru dihasilkan).
 ```
 
-### 2. Sesi Google kepegawaian
-Google **memblokir** Chromium otomatis ("browser may not be secure").
-Solusinya: login sekali lewat **Edge asli Windows** via CDP.
+### 2. Kunci API kepegawaian
+Impor butuh kunci dengan scope **`impor`** (buat di panel Kepegawaian →
+Master → API Key):
 
-**a. Luncurkan Edge dengan debug port** (dari WSL, profil terpisah agar tak ganggu Edge biasa):
-```bash
-"/mnt/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe" \
-  --remote-debugging-port=9222 --user-data-dir="C:\\edge-debug" --no-first-run &
+```
+KEPEG_API_KEY=dpmk_...
 ```
 
-**b. Jalankan login via CDP:**
+Taruh di `.env`, lalu `docker compose up -d --force-recreate`.
+
+Cek kunci:
 ```bash
-cd /root/docker/hermes
-source .venv/bin/activate
-python -m hermes login-google --cdp http://127.0.0.1:9222
+curl -s -X POST https://kepegawaian.it-dpmptsp.my.id/api/v1/impor-cuti \
+  -H "X-API-Key: $KEPEG_API_KEY"
+# {"ok":false,"error":"Berkas Excel cuti ... wajib dikirim ... field \"file\"."}
+# → kunci valid & scope benar (galatnya soal berkas, bukan soal akses)
 ```
-
-Jendela Edge terbuka → login `riyantonugroho.work@gmail.com` → setelah masuk aplikasi,
-sesi **tersimpan otomatis** ke `data/google_session.json`.
-
-> Setelah sesi tersimpan, login berikutnya tidak perlu lagi — Google tidak dipanggil ulang;
-> Hermes hanya memakai cookie sesi aplikasi.
 
 ---
 
 ## Menjalankan
 
-### Lewat chat web
-Buka `http://localhost:10000`, login, lalu ketik:
+### Lewat dashboard
+Buka `https://hermes.it-dpmptsp.my.id`, tab **Alur**, kartu **Rekap E-Cuti**,
+lalu klik **▶ Jalankan**. Isi tanggal bila perlu — kosong berarti sebulan terakhir.
 
-```
-ambil rekap e-cuti
-```
-
-atau variasi yang dikenali: *"export rekap cuti"*, *"impor cuti"*, *"rekap e-cuti bulan ini"*.
-
-### Cek prasyarat sebelum jalan
+### Lewat CLI
 ```bash
-docker exec hermes-agent python -c "
-from hermes import config, recipe_ecuti
-c = config.get_config()
-login = recipe_ecuti.bitwarden_login(c, '2017skpd019')
-print('Bitwarden:', 'OK ' + login[0] if login else 'BELUM')
-print('Sesi Google:', 'OK' if recipe_ecuti.google_state_path(c).is_file() else 'BELUM')
-"
+docker exec hermes-agent python -m hermes recipe run ecuti_rekap
+docker exec hermes-agent python -m hermes recipe run ecuti_rekap tanggal_mulai=2026-11-01
 ```
 
 ---
 
 ## Rentang tanggal
 
-Otomatis: **hari ini − 1 bulan** s/d **hari ini**, format `DD-MM-YYYY`.
-Contoh: hari ini 9 Nov 2026 → `09-10-2026` s/d `09-11-2026`.
+Otomatis: **hari ini − 1 bulan** s/d **hari ini**, format `yyyy-mm-dd`.
+Contoh: hari ini 11 Nov 2026 → `2026-10-11` s/d `2026-11-11`.
+
+---
+
+## Hasil impor
+
+Respons API dipetakan ke ringkasan di dashboard:
+
+| Kunci API | Arti |
+|---|---|
+| `inserted` | baris baru (`No Surat` belum ada) |
+| `updated` | baris diperbarui (upsert per `No Surat`) |
+| `skipped` | baris dilewati karena pernah diedit manual di panel |
+| `tanpa_surat` | baris dilewati karena `No Surat` kosong |
+| `status_lain` | baris dilewati karena status bukan **TTE Kepala Dinas** |
+
+`jumlah_diproses` **tidak** mencakup `tanpa_surat` dan `status_lain`; total
+baris di berkas dihitung `inserted + updated + jumlah_dilewati`.
+
+Impor sukses membuka gerbang "impor cuti hari ini" untuk Generator Surat Cuti
+(`import_hari_ini: true`).
 
 ---
 
@@ -100,10 +114,11 @@ Alur berhenti dengan pesan `step` yang jelas:
 
 | Pesan | Arti | Solusi |
 |---|---|---|
-| `step: login` + "Kredensial SIMPATIK tidak tersedia" | Bitwarden terkunci / item tak ada | Buka vault (Langkah 1) |
+| `step: login` + "Kredensial SIMPATIK tidak tersedia" | Bitwarden terkunci / item tak ada | Buka vault (Prasyarat 1) |
 | `step: login` + "Field login tidak ditemukan" | Selector halaman login berubah | Kirim screenshot halaman login |
-| `step: google` | Sesi Google belum ada | Jalankan `/login-google` |
-| `step: import` + "FilePond input tidak ditemukan" | Halaman impor berubah | Kirim screenshot halaman impor |
+| `step: jaringan` + "IP bukan dari Indonesia" | SIMPATIK melakukan geoblock | Jalankan dari jaringan Indonesia |
+| `step: import` + `API impor 401/403` | Kunci salah / scope bukan `impor` | Periksa `KEPEG_API_KEY` |
+| `step: import` + `API impor 422` | Header kolom Excel tidak cocok | Pastikan berkas dari e-cuti, bukan hasil edit manual |
 
 ---
 
@@ -111,8 +126,9 @@ Alur berhenti dengan pesan `step` yang jelas:
 
 - **CSRF token** diambil otomatis oleh browser saat halaman dimuat (tidak perlu diisi).
 - **Aturan impor**: hanya baris ber-status **TTE Kepala Dinas** yang diimpor.
-  `No Surat` yang sudah ada → diperbarui; belum ada → ditambahkan.
+  `No Surat` yang sudah ada → diperbarui; belum ada → ditambahkan; data lama yang
+  tidak ada di berkas tetap tersimpan.
 - **Kolom Excel** (urutan wajib, dari sistem): `No, No Surat, Nip, Nama,
   Tanggal Mulai Diajukan, Tanggal Selesai Diajukan, Opd, Unit Kerja,
   Lokasi Kerja, Status, Keperluan, Jenis`.
-- Alur berjalan **headless** (tanpa ganggu layar), kecuali `/login-google`.
+- Alur berjalan **headless** (tanpa ganggu layar).

@@ -113,6 +113,85 @@ RECIPES: list[dict] = [
         "notify": True,
         "schedule": "0 8 * * *",
     },
+    {
+        "key": "duk_mingguan",
+        "title": "Impor DUK Mingguan",
+        "description": (
+            "Cetak Daftar Urut Kepangkatan dari SISDM lalu impor ke "
+            "kepegawaian sebagai batch baru."
+        ),
+        "triggers": ["duk", "daftar urut kepangkatan", "impor duk"],
+        "steps": [
+            "Login SIMPATIK (Bitwarden)",
+            "Ambil token SISDM",
+            "Cetak halaman DUK ke PDF",
+            "Unggah ke API impor-duk",
+        ],
+        # Tanpa input: satu tombol "Jalankan", tanpa dialog.
+        "inputs": [],
+        "needs_vault": True,
+        "notify": True,
+        # Senin 07:00, seminggu sekali. Batch lama tidak dihapus oleh API,
+        # jadi menjalankan ulang aman (hanya menambah batch).
+        "schedule": "0 7 * * 1",
+    },
+    {
+        "key": "pegawai_harian",
+        "title": "Data Pegawai Aktif",
+        "description": (
+            "Ekstrak profil + riwayat pegawai aktif dari SISDM, lalu impor "
+            "ke kepegawaian sebagai snapshot baru."
+        ),
+        "triggers": ["data pegawai", "pegawai aktif", "impor pegawai"],
+        "steps": [
+            "Login SIMPATIK (Bitwarden)",
+            "Ambil token SISDM",
+            "Filter OPD + tampilkan semua pegawai",
+            "Ekstrak profil & riwayat tiap pegawai aktif",
+            "Unggah ke API impor-pegawai",
+        ],
+        "inputs": [
+            {
+                "name": "kd_skpd",
+                "label": "Kode OPD",
+                "type": "text",
+                "required": False,
+                "help": "Kosongkan untuk 019 (Dinas Penanaman Modal dan Pelayanan Terpadu Satu Pintu).",
+            },
+        ],
+        "needs_vault": True,
+        "notify": True,
+        # Jumat 07:00, seminggu sekali.
+        "schedule": "0 7 * * 5",
+    },
+    {
+        "key": "bersih_output",
+        "title": "Bersihkan Berkas Unduhan",
+        "description": (
+            "Hapus hasil unduhan lama di folder output agar tidak menumpuk. "
+            "Berkas yang lebih baru dari batas retensi dibiarkan."
+        ),
+        "triggers": ["bersihkan output", "hapus berkas lama", "bersihkan unduhan"],
+        "steps": [
+            "Pindai folder output",
+            "Hapus berkas melewati batas retensi",
+            "Laporkan jumlah yang dihapus",
+        ],
+        "inputs": [
+            {
+                "name": "retensi",
+                "label": "Retensi (hari)",
+                "type": "number",
+                "required": False,
+                "help": "Kosongkan untuk memakai HERMES_OUTPUT_RETENSI_HARI (default 7).",
+            },
+        ],
+        # Tidak menyentuh portal mana pun — cukup filesystem lokal.
+        "needs_vault": False,
+        "notify": True,
+        # Minggu 23:00: bersihkan setelah semua alur mingguan selesai.
+        "schedule": "0 23 * * 0",
+    },
 ]
 
 _BY_KEY = {r["key"]: r for r in RECIPES}
@@ -204,6 +283,20 @@ def execute(cfg: "Config", key: str, inputs: dict) -> dict:
         from . import recipe_magang
 
         return recipe_magang.run_magang(cfg)
+    if key == "duk_mingguan":
+        from . import recipe_duk
+
+        return recipe_duk.run_duk(cfg)
+    if key == "bersih_output":
+        from . import recipe_bersih
+
+        return recipe_bersih.run_bersih(cfg, retensi=str(inputs.get("retensi") or ""))
+    if key == "pegawai_harian":
+        from . import recipe_pegawai
+
+        return recipe_pegawai.run_pegawai(
+            cfg, kd_skpd=str(inputs.get("kd_skpd") or "")
+        )
     raise KeyError(f"Recipe '{key}' tidak punya pelaksana.")
 
 
@@ -252,13 +345,49 @@ def summarize(key: str, result: dict) -> str:
             lines.append(f"· {d.get('nama', '?')} → {d.get('nomor', '?')}")
         for d in (result.get("detail_dilewati") or [])[:10]:
             lines.append(f"· (sudah) {d.get('nama', '?')} → {d.get('nomor', '?')}")
+    if "dihapus" in result and "retensi_hari" in result:
+        lines.append(
+            f"🧹 Berkas dihapus: {result.get('dihapus', 0)} "
+            f"({result.get('kb', 0)} KB) · retensi {result['retensi_hari']} hari"
+        )
+        for d in (result.get("detail_dihapus") or [])[:15]:
+            lines.append(f"· {d.get('nama')} ({d.get('kb')} KB)")
+    if "created" in result and "updated" in result:
+        # Resume singkat: yang penting jumlah pegawai dan komposisi
+        # PNS/PPPK, bukan daftar nama (57 baris nama = notifikasi tak terbaca).
+        lines.append(f"👥 Pegawai aktif: {result.get('jumlah', 0)}")
+        lines.append(
+            f"· PNS: {result.get('pns', 0)} · PPPK: {result.get('pppk', 0)}"
+        )
+        if result.get("gagal"):
+            lines.append(f"⚠️ Gagal diekstrak: {result['gagal']}")
+        lines.append(
+            f"📥 Impor: {result.get('created', 0)} baru · "
+            f"{result.get('updated', 0)} diperbarui"
+        )
+        if result.get("durasi_detik"):
+            lines.append(f"⏱️ {result['durasi_detik']} detik")
+    if "batch_id" in result:
+        lines.append(
+            f"🗂️ Batch DUK #{result.get('batch_id')}: "
+            f"{result.get('jumlah', 0)} baris"
+        )
+        if result.get("periode"):
+            lines.append(f"📅 Periode: {result['periode']}")
+        if result.get("opd"):
+            lines.append(f"🏢 {result['opd']}")
+    if result.get("pdf"):
+        lines.append(f"📄 {result['pdf']}")
     if result.get("xlsx"):
         lines.append(f"📄 {result['xlsx']}")
     if result.get("range"):
         lines.append(f"📅 Rentang: {result['range']}")
     if result.get("warning"):
         lines.append(f"⚠️ {result['warning']}")
-    if result.get("log"):
+    # Log lengkap (mis. 57 nama pegawai) tetap tersimpan untuk tab Log
+    # dashboard, tapi tidak dicetak di notifikasi — sudah diringkas di atas.
+    ringkas_saja = "created" in result and "updated" in result
+    if result.get("log") and not ringkas_saja:
         lines.append("→ " + " · ".join(result["log"]))
     return "\n".join(lines)
 
@@ -305,9 +434,17 @@ def notify_recipe(cfg: "Config", key: str, result: dict) -> None:
 
     ok = bool(result.get("ok"))
     # "Berubah" berbeda per recipe: penomoran mengisi nomor, rekap menghasilkan
-    # file, dan pemantauan magang hanya berarti kalau ada pengajuan baru.
+    # file, pemantauan magang hanya berarti kalau ada pengajuan baru, DUK dan
+    # data pegawai selalu berarti karena setiap run menyimpan snapshot baru,
+    # dan pembersihan hanya berarti kalau benar-benar ada berkas yang dihapus.
     if "total_pengajuan" in result:
         berubah = bool(result.get("baru"))
+    elif "retensi_hari" in result:
+        berubah = bool(result.get("dihapus"))
+    elif "created" in result and "updated" in result:
+        berubah = bool(result.get("jumlah"))
+    elif "batch_id" in result:
+        berubah = bool(result.get("jumlah"))
     else:
         berubah = bool(result.get("terisi") or result.get("xlsx"))
     if ok and not berubah:
