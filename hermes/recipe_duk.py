@@ -1,20 +1,24 @@
-"""Recipe DUK: login SIMPATIK → token SISDM → cetak /duk jadi PDF → impor API.
+"""Recipe DUK: login SIMPATIK → token SISDM → baca /duk → impor JSON.
 
 Alur tetap (bukan ditebak LLM) karena melibatkan:
   - login SIMPATIK via kredensial Bitwarden
   - token SSO `/token?app=sisdm` yang mengarahkan ke portal SISDM
-  - halaman `/duk` adalah dokumen cetak (tanpa form), jadi PDF diambil
-    dengan `page.pdf()` bukan tombol unduh
-  - unggah berkas ke `POST /api/v1/impor-duk` (multipart, X-API-Key)
+  - halaman `/duk` adalah dokumen cetak tanpa form, jadi tabelnya dibaca
+    langsung dari HTML (bukan dicetak PDF lalu di-parse ulang)
+  - kirim baris terstruktur ke `POST /api/v1/impor-duk-json`
 
-Halaman /duk tidak punya filter periode; yang tercetak adalah DUK berjalan
+Kenapa JSON, bukan PDF: impor PDF harus menebak kolom dari koordinat teks
+(`pdftotext -bbox`), dan tebakan itu meleset untuk baris tertentu. Di sini
+kolom sudah pasti karena dibaca dari `<td>` aslinya, jadi tidak ada lagi
+penebakan di sisi server.
+
+Halaman /duk tidak punya filter periode; yang terbaca adalah DUK berjalan
 saat resep dijalankan. Impor menyimpan batch baru dan tidak menghapus batch
 lama, jadi riwayat tetap utuh.
 """
 from __future__ import annotations
 
 from datetime import date
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -23,34 +27,21 @@ if TYPE_CHECKING:
 SISDM_DUK = "https://sisdm.semarangkota.go.id/duk"
 SISDM_TOKEN = "http://simpatik.semarangkota.go.id/token?app=sisdm"
 
-# Batas waktu halaman DUK memuat seluruh baris sebelum dicetak.
+# Batas waktu halaman DUK memuat seluruh baris.
 DUK_READY_TIMEOUT = 30000
 
 
 def _nama_berkas() -> str:
-    return f"DUK-{date.today():%Y-%m-%d}.pdf"
-
-
-def _cetak_pdf(page, path: Path) -> None:
-    """Cetak halaman DUK ke PDF ber-text-layer (bukan hasil scan).
-
-    `print_background` agar garis tabel ikut; ukuran A4 lanskap karena kolom
-    DUK lebar (NO, NAMA, NIP, PANGKAT, JABATAN, MASA KERJA, PENDIDIKAN).
-    """
-    page.pdf(
-        path=str(path),
-        format="A4",
-        landscape=True,
-        print_background=True,
-        margin={"top": "10mm", "bottom": "10mm", "left": "8mm", "right": "8mm"},
-    )
+    return f"DUK-{date.today():%Y-%m-%d}.json"
 
 
 def run_duk(cfg: "Config", bw_item: str = "2017skpd019") -> dict:
-    """Jalankan resep DUK: login → cetak PDF → impor ke kepegawaian."""
+    """Jalankan resep DUK: login → baca tabel → impor JSON."""
+    import json
+
     from playwright.sync_api import sync_playwright
 
-    from . import kepeg, recipe_ecuti
+    from . import duk_parse, kepeg, recipe_ecuti
 
     login = recipe_ecuti.bitwarden_login(cfg, bw_item)
     if login is None:
@@ -131,54 +122,63 @@ def run_duk(cfg: "Config", bw_item: str = "2017skpd019") -> dict:
             log.append(f"Token → {pg.url[:60]}")
 
             # --- halaman DUK ---
-            pg.goto(SISDM_DUK, wait_until="domcontentloaded")
-            try:
-                pg.wait_for_selector("table tr", timeout=DUK_READY_TIMEOUT)
-            except Exception:  # noqa: BLE001
-                ctx.close()
-                browser.close()
-                return {
-                    "ok": False, "step": "duk", "log": log,
-                    "error": "Tabel DUK tidak muncul (halaman berubah / sesi ditolak).",
-                }
-            pg.wait_for_timeout(2000)  # beri waktu baris terakhir ter-render
-
-            baris = len(pg.query_selector_all("table tr"))
-            log.append(f"Halaman DUK terbuka: {baris} baris tabel")
-            if baris < 2:
-                ctx.close()
-                browser.close()
-                return {
-                    "ok": False, "step": "duk", "log": log,
-                    "error": "Tabel DUK kosong — PDF tidak dicetak.",
-                }
-
-            pdf_path = out_dir / _nama_berkas()
-            _cetak_pdf(pg, pdf_path)
+            # Dibaca lewat ctx.request (cookie sesi ikut) supaya HTML-nya utuh
+            # tanpa perlu menunggu aset halaman. Isi respons diambil SEBELUM
+            # konteks ditutup — `Response.text()` sesudah `ctx.close()` gagal
+            # dengan "Event loop is closed".
+            r = ctx.request.get(SISDM_DUK, timeout=60000)
+            html_duk = r.text() if r.status == 200 else ""
+            status_duk = r.status
             ctx.close()
             browser.close()
 
-        ukuran = pdf_path.stat().st_size
-        log.append(f"PDF tercetak: {pdf_path.name} ({ukuran // 1024} KB)")
-        if ukuran < 1024:
-            return {"ok": False, "step": "pdf", "pdf": str(pdf_path), "log": log,
-                    "error": f"PDF terlalu kecil ({ukuran} byte) — kemungkinan kosong."}
+        if status_duk != 200:
+            return {
+                "ok": False, "step": "duk", "log": log,
+                "error": f"Halaman DUK menolak akses (HTTP {status_duk}).",
+            }
 
-        # --- impor lewat API ---
-        imp = kepeg.impor_duk(cfg, str(pdf_path))
+        hasil = duk_parse.parse_duk(html_duk)
+        log.append(f"Halaman DUK terbaca: {hasil['jumlah']} baris pegawai")
+
+        if hasil["jumlah"] == 0:
+            return {
+                "ok": False, "step": "duk", "log": log,
+                "error": "Tabel DUK tidak berisi baris pegawai (halaman berubah / sesi ditolak).",
+            }
+
+        json_path = out_dir / _nama_berkas()
+        json_path.write_text(
+            json.dumps(hasil, ensure_ascii=False, indent=1), encoding="utf-8"
+        )
+        log.append(f"JSON tersimpan: {json_path.name}")
+
+        # --- impor lewat API JSON ---
+        imp = kepeg.impor_duk_json(
+            cfg,
+            rows=hasil["rows"],
+            opd=hasil["opd"],
+            periode=hasil["periode"],
+        )
         log.append(
             f"Impor batch {imp.get('batch_id')}: {imp.get('jumlah', 0)} baris"
         )
 
+        dilewati = imp.get("dilewati") or 0
+        if dilewati:
+            log.append(f"Dilewati server: {dilewati} baris")
+
         return {
             "ok": True,
             "step": "done",
-            "pdf": str(pdf_path),
+            "json": str(json_path),
             "batch_id": imp.get("batch_id"),
             "jumlah": imp.get("jumlah", 0),
+            "dilewati": dilewati,
+            "errors": imp.get("errors") or [],
             "periode": imp.get("periode") or "",
             "opd": imp.get("opd") or "",
-            "berkas": imp.get("berkas") or pdf_path.name,
+            "berkas": imp.get("original_filename") or json_path.name,
             "log": log,
         }
     except Exception as e:  # noqa: BLE001

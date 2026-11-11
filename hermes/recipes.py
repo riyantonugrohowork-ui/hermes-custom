@@ -117,15 +117,15 @@ RECIPES: list[dict] = [
         "key": "duk_mingguan",
         "title": "Impor DUK Mingguan",
         "description": (
-            "Cetak Daftar Urut Kepangkatan dari SISDM lalu impor ke "
+            "Baca Daftar Urut Kepangkatan dari SISDM lalu impor ke "
             "kepegawaian sebagai batch baru."
         ),
         "triggers": ["duk", "daftar urut kepangkatan", "impor duk"],
         "steps": [
             "Login SIMPATIK (Bitwarden)",
             "Ambil token SISDM",
-            "Cetak halaman DUK ke PDF",
-            "Unggah ke API impor-duk",
+            "Baca tabel DUK jadi JSON",
+            "Kirim ke API impor-duk-json",
         ],
         # Tanpa input: satu tombol "Jalankan", tanpa dialog.
         "inputs": [],
@@ -372,10 +372,14 @@ def summarize(key: str, result: dict) -> str:
             f"🗂️ Batch DUK #{result.get('batch_id')}: "
             f"{result.get('jumlah', 0)} baris"
         )
+        if result.get("dilewati"):
+            lines.append(f"⚠️ Dilewati: {result['dilewati']} baris")
         if result.get("periode"):
             lines.append(f"📅 Periode: {result['periode']}")
         if result.get("opd"):
             lines.append(f"🏢 {result['opd']}")
+    if result.get("json"):
+        lines.append(f"📄 {result['json']}")
     if result.get("pdf"):
         lines.append(f"📄 {result['pdf']}")
     if result.get("xlsx"):
@@ -386,7 +390,10 @@ def summarize(key: str, result: dict) -> str:
         lines.append(f"⚠️ {result['warning']}")
     # Log lengkap (mis. 57 nama pegawai) tetap tersimpan untuk tab Log
     # dashboard, tapi tidak dicetak di notifikasi — sudah diringkas di atas.
-    ringkas_saja = "created" in result and "updated" in result
+    ringkas_saja = (
+        ("created" in result and "updated" in result)
+        or "batch_id" in result
+    )
     if result.get("log") and not ringkas_saja:
         lines.append("→ " + " · ".join(result["log"]))
     return "\n".join(lines)

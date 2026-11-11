@@ -1,7 +1,7 @@
 """Resep: bersihkan berkas hasil unduhan di folder output.
 
 Rekap e-cuti dan DUK menghasilkan berkas baru setiap kali dijalankan
-(`output/ecuti/*.xls`, `output/duk/*.pdf`). Tanpa pembersihan folder itu
+(`output/ecuti/*.xls`, `output/duk/*.json`). Tanpa pembersihan folder itu
 terus membesar. Resep ini menghapus berkas yang umurnya melewati batas
 retensi; folder dan berkas baru dibiarkan.
 

@@ -32,8 +32,9 @@ hermes/
   recipe_ecuti.py     alur rekap E-Cuti (export → impor kepegawaian)
   recipe_penomoran.py alur penomoran surat cuti
   recipe_magang.py    pemantau pengajuan magang (portal izin)
-  recipe_duk.py       alur cetak DUK (SISDM → PDF → impor)
+  recipe_duk.py       alur DUK (SISDM → JSON → impor)
   recipe_pegawai.py   alur data pegawai (SISDM → JSON → impor)
+  duk_parse.py        parser HTML DUK (tabel → baris, murni)
   sisdm_pegawai.py    parser HTML SISDM (profil + riwayat, murni)
   recipe_bersih.py    pembersih berkas lama di output/
   webui.py            dashboard (http.server bawaan, tanpa dependency)
@@ -101,17 +102,31 @@ entri di situ + satu cabang di `recipes.execute()`.
 ### `duk_mingguan` — Impor DUK
 - **Jadwal:** `0 7 * * 1` (Senin 07:00, mingguan)
 - **Input:** tidak ada — satu tombol saja.
-- **Langkah:** login SIMPATIK → `token?app=sisdm` → buka
-  `https://sisdm.semarangkota.go.id/duk` → `page.pdf()` (A4 lanskap,
-  `print_background`) → `POST /api/v1/impor-duk`.
-- **PDF hasil:** `output/duk/DUK-YYYY-MM-DD.pdf`, ikut bind-mount `./output`,
-  jadi tersimpan permanen di host (bukan temporary container).
-- **Halaman `/duk` tanpa form/filter** — murni dokumen cetak. Periode kosong
-  dan yang tercetak adalah DUK berjalan saat resep dijalankan.
-- **Text layer wajib:** PDF dibuat Chromium dari HTML (bukan scan), jadi
-  `pdftotext` di sisi kepegawaian bisa mengekstraknya. Terbukti 33 baris dari
-  3 halaman.
-- **PDF terlalu kecil (< 1 KB) dianggap gagal** dan tidak diunggah.
+- **Langkah:** login SIMPATIK → `token?app=sisdm` → ambil
+  `https://sisdm.semarangkota.go.id/duk` lewat `ctx.request` → parse tabel
+  jadi baris terstruktur (`duk_parse.parse_duk`) → `POST /api/v1/impor-duk-json`.
+- **JSON hasil:** `output/duk/DUK-YYYY-MM-DD.json` (bind-mount, permanen di
+  host). Tidak ada PDF lagi — kolom dibaca langsung dari `<td>`, jadi tidak
+  ada penebakan koordinat di sisi server.
+- **Kenapa JSON, bukan PDF:** impor PDF menebak kolom dari posisi teks
+  (`pdftotext -bbox`) dan tebakan itu meleset untuk sebagian baris. Kolom
+  `<td>` sudah pasti, jadi nilai dikirim apa adanya.
+- **`jabatan` dan `eselon` dipisah di parser** pada garis miring TERAKHIR —
+  nama jabatan sendiri bisa memuat "/" (`Pranata Komputer Ahli Muda/Muda / JF`
+  → eselon `JF`).
+- **`masa_kerja_bulan` bisa > 12** (mis. `24 bulan`) karena itu angka resmi
+  dari dokumen. Jangan dinormalkan; normalkan justru membuatnya beda dari
+  sumber.
+- **NIP bisa ganda di sumber.** DUK-2026-11-11 berisi 33 baris dengan 31 NIP
+  unik (baris 1–2 dan 13–14 identik per pasangan). Datanya memang begitu di
+  SISDM, bukan bug parser — jangan pakai `nip` sebagai kunci baris.
+- **`periode` selalu null**: halaman `/duk` mencetak `PERIODE :` kosong.
+- **Halaman `/duk` tanpa form/filter** — murni dokumen cetak; yang terbaca
+  adalah DUK berjalan saat resep dijalankan.
+- **Isi respons harus dibaca sebelum `ctx.close()`** — `Response.text()`
+  sesudah konteks ditutup gagal dengan "Event loop is closed".
+- **Baris tanpa `nama` dibuang di parser** karena server menolaknya per baris.
+  Bila semua baris gagal, API menjawab 422 dan tidak menyimpan batch.
 
 ### `pegawai_harian` — Data Pegawai Aktif
 - **Jadwal:** `0 7 * * 5` (Jumat 07:00, mingguan)
@@ -233,7 +248,7 @@ Auto-refresh 15 detik hanya saat tab Dashboard aktif.
 | `data/magang_seen.json` | kode `MGNG-*` yang sudah dilaporkan |
 | `data/bw-config/` | config & login Bitwarden antar-restart |
 | `output/ecuti/` | Excel hasil export |
-| `output/duk/` | PDF DUK hasil cetak |
+| `output/duk/` | JSON DUK hasil baca tabel |
 | `output/pegawai/` | JSON data pegawai aktif |
 
 **Jangan pernah** commit atau echo isi `.env` dan `secrets/`.

@@ -163,23 +163,38 @@ def impor_cuti(cfg: "Config", path: str) -> dict:
     return r.json()
 
 
-def impor_duk(cfg: "Config", path: str, sumber_label: str = "hermes-duk-v1") -> dict:
-    """Unggah PDF DUK ke tabel duk (batch baru; batch lama tidak dihapus).
+def impor_duk_json(
+    cfg: "Config",
+    rows: list[dict],
+    opd: str | None = None,
+    periode: str | None = None,
+    sumber_label: str = "hermes-duk-json-v1",
+    original_filename: str = "hermes-duk-json",
+) -> dict:
+    """Kirim baris DUK terstruktur ke `POST /api/v1/impor-duk-json`.
 
-    PDF wajib punya text layer — server mengekstraknya dengan pdftotext.
+    Berbeda dari `impor_duk`, tidak ada PDF dan tidak ada penebakan kolom:
+    nilai dikirim apa adanya. Server tetap membuat batch baru dan tidak
+    menghapus batch lama. Baris tanpa `nama` dilewati server dan dilaporkan
+    di `errors`; bila semua baris gagal, server menjawab 422 tanpa menyimpan
+    batch.
     """
     import requests
 
-    with open(path, "rb") as fh:
-        r = requests.post(
-            f"{_base(cfg)}/impor-duk",
-            headers={"X-API-Key": _key(cfg)},
-            files={"file": (os.path.basename(path), fh, "application/pdf")},
-            data={"sumber_label": sumber_label},
-            timeout=300,
-        )
+    r = requests.post(
+        f"{_base(cfg)}/impor-duk-json",
+        headers={"X-API-Key": _key(cfg), "Content-Type": "application/json"},
+        json={
+            "opd": opd,
+            "periode": periode,
+            "sumber_label": sumber_label,
+            "original_filename": original_filename,
+            "rows": rows,
+        },
+        timeout=300,
+    )
     if r.status_code >= 400:
-        raise RuntimeError(f"API impor-duk {r.status_code}: {_pesan(r)}")
+        raise RuntimeError(f"API impor-duk-json {r.status_code}: {_pesan(r)}")
     return r.json()
 
 
