@@ -31,6 +31,20 @@ MAX_HALAMAN = int(os.getenv("PENOMORAN_MAX_HALAMAN", "3"))
 # "Verifikasi Atasan Atasan Langsung".
 STATUS_TARGETS = ("Pemberian Nomor Surat OPD", "Verifikasi Atasan")
 
+# Jenis cuti yang aturannya bergantung status ASN: "Cuti Karena Alasan
+# Penting" hanya untuk PNS. PPPK/PPPK Paruh Waktu tidak berhak.
+JENIS_CKAP = "Cuti Karena Alasan Penting"
+
+# Pengajuan CKAP yang masih bisa diubah statusnya. Yang sudah lewat
+# (TTE Kepala Dinas, selesai, ditolak) tidak perlu diperingatkan lagi.
+STATUS_MASIH_BISA_DIUBAH = ("Pengajuan", "Verifikasi Atasan")
+
+# Jenis ASN yang TIDAK boleh mengajukan CKAP.
+ASN_TIDAK_BERHAK_CKAP = ("PPPK", "PPPK Paruh Waktu")
+
+# Jenis cuti pengganti yang dimintakan untuk CKAP milik PPPK.
+JENIS_TUJUAN_CKAP_PPPK = "Cuti Tahunan"
+
 # Baris tabel Pengajuan (index kolom sesuai <thead> di halaman).
 COL_NIP = 1          # Nama | NIP | Lokasi Kerja
 COL_TANGGAL = 2      # Tanggal | Jenis | Keperluan
@@ -63,6 +77,101 @@ def _kunci_baris(nama: str, pengajuan: str) -> str:
 def _perlu_dinomori(status: str) -> bool:
     s = _clean(status)
     return any(s.startswith(p) for p in STATUS_TARGETS)
+
+
+def _status_masih_bisa_diubah(status: str) -> bool:
+    """Pengajuan yang belum final — masih mungkin diubah jenisnya."""
+    s = _clean(status)
+    return any(s.startswith(p) for p in STATUS_MASIH_BISA_DIUBAH)
+
+
+def _adalah_ckap(jenis: str) -> bool:
+    return _clean(jenis).lower() == JENIS_CKAP.lower()
+
+
+def format_teks_ckap(temuan: list[dict]) -> str:
+    """Teks siap-copas permintaan ubah status, satu blok per pengajuan.
+
+    Bentuknya mengikuti extension "Permintaan Ubah Status Cuti" yang biasa
+    dipakai, supaya bisa langsung ditempel ke WhatsApp tanpa disunting:
+    identitas pegawai, jenis cuti asal → tujuan, lalu bagian "Ket" bernomor.
+    """
+    blok: list[str] = []
+
+    for t in temuan:
+        nip = t.get("nip") or "-"
+        tanggal = rentang_teks(t.get("tanggal_teks", "")) or "-"
+        blok.append("\n".join([
+            f"Status ASN: {t.get('jenis_asn') or '-'}",
+            f"Nama : {t.get('nama') or '-'}",
+            f"NIP : {nip}",
+            f"Jenis Cuti : {JENIS_TUJUAN_CKAP_PPPK}",
+            f"Alasan Cuti : {t.get('keperluan') or '-'}",
+            f"Tanggal Cuti : {tanggal}",
+            "",
+            "Ket :",
+            f"1. STATUS ASN : {t.get('jenis_asn') or '-'}",
+            f"2. Jenis Cuti : {JENIS_CKAP} menjadi {JENIS_TUJUAN_CKAP_PPPK.lower()}",
+            f"3. {nip}",
+        ]))
+
+    if not blok:
+        return ""
+
+    return ("\n" + "-" * 40 + "\n").join(blok) + "\n\nTerima Kasih🙏🏻"
+
+
+def periksa_ckap_pppk(cfg: "Config", semua: list[dict], log: list[str] | None = None) -> list[dict]:
+    """Cari pengajuan "Cuti Karena Alasan Penting" milik PPPK.
+
+    Aturan kepegawaian: CKAP hanya untuk PNS — PPPK/PPPK Paruh Waktu tidak
+    berhak. Pengajuan seperti ini tidak boleh diberi nomor; yang dibutuhkan
+    adalah perubahan status, jadi temuannya dilaporkan ke Telegram.
+
+    Status ASN diambil dari `GET /api/v1/pegawai/{nip}`, bukan ditebak dari
+    NIP: hanya server yang tahu status kepegawaian terbaru. Hanya pengajuan
+    yang belum final (`Pengajuan` / `Verifikasi Atasan`) yang dilaporkan —
+    yang sudah TTE Kepala Dinas tidak perlu diubah lagi.
+
+    Kegagalan cek satu NIP tidak menghentikan sisanya: NIP itu dilewati dan
+    dicatat di log, karena status yang tidak diketahui tidak boleh dianggap
+    PPPK (maupun PNS).
+    """
+    from . import kepeg
+
+    log = log if log is not None else []
+    temuan: list[dict] = []
+    sudah_dicek: dict[str, str] = {}
+
+    for r in semua:
+        if not _adalah_ckap(r.get("jenis", "")):
+            continue
+        if not _status_masih_bisa_diubah(r.get("status", "")):
+            continue
+
+        nip = r.get("nip", "")
+        if not nip:
+            log.append(f"CKAP {r.get('nama', '?')}: NIP kosong, status ASN tak bisa dicek")
+            continue
+
+        if nip not in sudah_dicek:
+            try:
+                sudah_dicek[nip] = kepeg.jenis_asn(cfg, nip)
+            except Exception as e:  # noqa: BLE001
+                log.append(f"CKAP {r.get('nama', '?')}: profil gagal ({type(e).__name__})")
+                sudah_dicek[nip] = ""
+
+        jenis_asn = sudah_dicek[nip]
+        if jenis_asn not in ASN_TIDAK_BERHAK_CKAP:
+            continue
+
+        temuan.append({**r, "jenis_asn": jenis_asn})
+        log.append(
+            f"CKAP oleh {jenis_asn}: {r.get('nama', '?')} "
+            f"(status {r.get('status', '?')}) — perlu ubah status"
+        )
+
+    return temuan
 
 
 def _clean(s: str) -> str:
@@ -374,7 +483,18 @@ def run_penomoran(
                 url = nxt
             log.append(f"Baris pengajuan terbaca: {len(semua)} (maks {MAX_HALAMAN} halaman)")
 
-            target = [r for r in semua if _perlu_dinomori(r["status"]) and r["link"]]
+            # CKAP oleh PPPK tidak boleh diberi nomor — yang dibutuhkan
+            # perubahan status. Diperiksa lebih dulu supaya barisnya tidak
+            # ikut masuk daftar nomor.
+            ckap_pppk = periksa_ckap_pppk(cfg, semua, log)
+            nip_ckap = {r.get("nip") for r in ckap_pppk}
+            teks_ckap = format_teks_ckap(ckap_pppk)
+
+            target = [
+                r for r in semua
+                if _perlu_dinomori(r["status"]) and r["link"]
+                and r.get("nip") not in nip_ckap
+            ]
             log.append(f"Baris perlu dinomori ({', '.join(STATUS_TARGETS)}): {len(target)}")
 
             # Lewati yang sudah bernomor SEBELUM meminta nomor baru, supaya
@@ -410,6 +530,8 @@ def run_penomoran(
                     "ok": True, "step": "done", "terisi": 0,
                     "dilewati": len(dilewati), "nomor_berikut": nomor_awal,
                     "detail_terisi": [], "detail_dilewati": dilewati,
+                    "ckap_pppk": ckap_pppk,
+                    "teks_ckap": teks_ckap,
                     "log": log + ["Tidak ada yang perlu diberi nomor."],
                 }
 
@@ -424,6 +546,8 @@ def run_penomoran(
                     "ok": True, "step": "dry_run", "terisi": len(terisi),
                     "dilewati": len(dilewati), "nomor_berikut": nomor_awal + len(perlu),
                     "detail_terisi": terisi, "detail_dilewati": dilewati,
+                    "ckap_pppk": ckap_pppk,
+                    "teks_ckap": teks_ckap,
                     "log": log + ["Mode simulasi: tidak ada yang diubah."],
                 }
 
@@ -541,6 +665,8 @@ def run_penomoran(
             "batch": batch,
             "detail_terisi": terisi,
             "detail_dilewati": dilewati,
+            "ckap_pppk": ckap_pppk,
+            "teks_ckap": teks_ckap,
             "log": log,
         }
     except Exception as e:  # noqa: BLE001

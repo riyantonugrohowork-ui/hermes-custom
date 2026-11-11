@@ -8,6 +8,7 @@ lagi lewat hapus_batch() supaya penomoran tidak melompat.
 from __future__ import annotations
 
 import os
+import re
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -56,6 +57,25 @@ def berikutnya(cfg: "Config", kode: str = "800") -> dict:
 
 def cari_pegawai(cfg: "Config", q: str) -> list[dict]:
     return (_get(cfg, "generator-surat-cuti/pegawai", {"q": q}) or {}).get("data", [])
+
+
+def profil(cfg: "Config", nip: str) -> dict:
+    """Profil satu pegawai via `GET /api/v1/pegawai/{nip}`.
+
+    Dipakai untuk memastikan status ASN (PNS/PPPK) sebelum menyimpulkan aturan
+    cuti. `nip` dinormalkan ke digit murni oleh server; NIP tak dikenal → 404
+    yang dilempar sebagai RuntimeError oleh `_get`.
+    """
+    return (_get(cfg, f"pegawai/{re.sub(r'\\D+', '', str(nip or ''))}") or {}).get("data") or {}
+
+
+def jenis_asn(cfg: "Config", nip: str) -> str:
+    """`jenis` ringkas dari profil: PNS / PPPK / PPPK Paruh Waktu / dst.
+
+    Kosong bila NIP tidak ada di data pegawai — pemanggil memperlakukan itu
+    sebagai "tidak diketahui", bukan sebagai PNS.
+    """
+    return str(profil(cfg, nip).get("jenis") or "").strip()
 
 
 def riwayat(cfg: "Config", limit: int = 20, sumber: str = "") -> list[dict]:

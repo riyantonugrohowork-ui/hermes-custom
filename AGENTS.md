@@ -74,13 +74,25 @@ entri di situ + satu cabang di `recipes.execute()`.
   `inserted + updated + jumlah_dilewati`.
 
 ### `penomoran_cuti` — Penomoran Surat Cuti
-- **Jadwal:** `0 */2 * * *` (tiap 2 jam)
-- **Langkah:** login SIMPATIK → baca tabel Pengajuan → isi No Surat untuk baris
-  berstatus target yang masih kosong → tulis register ke Google Sheet.
+- **Jadwal:** `0 * * * *` (tiap 1 jam)
+- **Langkah:** login SIMPATIK → baca tabel Pengajuan → periksa CKAP milik PPPK →
+  isi No Surat untuk baris berstatus target yang masih kosong → tulis register
+  ke Google Sheet.
 - **Status target:** `Pemberian Nomor Surat OPD` dan `Verifikasi Atasan`
   (mencakup "Verifikasi Atasan Langsung" & "... Atasan Langsung").
 - **Batas pindai:** `PENOMORAN_MAX_HALAMAN` (default `3`) — hanya halaman teratas,
   karena pengajuan baru selalu muncul di atas.
+- **CKAP oleh PPPK tidak boleh diberi nomor.** "Cuti Karena Alasan Penting"
+  hanya untuk PNS; PPPK/PPPK Paruh Waktu tidak berhak. Baris seperti ini
+  dilewati dari penomoran dan dilaporkan ke Telegram agar statusnya diubah.
+  - Status ASN diambil dari `GET /api/v1/pegawai/{nip}` (`jenis`), **bukan
+    ditebak dari NIP** — hanya server yang tahu status terbaru.
+  - Hanya pengajuan belum final (`Pengajuan`, `Verifikasi Atasan*`) yang
+    dilaporkan; yang sudah `TTE Kepala Dinas` tidak perlu diubah lagi.
+  - Profil gagal diambil → NIP itu dilewati, **tidak** dianggap PPPK.
+  - Notifikasi mengirim dua pesan: ringkasan temuan, lalu teks siap-copas
+    dalam `<pre>` (sekali tap untuk salin). Temuan saja sudah cukup memicu
+    notifikasi walau tidak ada nomor yang diisi.
 - **Aturan tetap:**
   - Nomor yang **sudah terisi di SIMPATIK tidak pernah ditimpa** (SIMPATIK sumber kebenaran, bukan Sheet).
   - Cuti **tahun lalu dilewati** (filter tahun berjalan).
@@ -181,7 +193,8 @@ jalur exception, agar kegagalan tidak senyap.
 |---|---|
 | Recipe gagal | ✅ selalu |
 | Penomoran mengisi nomor | ✅ |
-| Penomoran 0 terisi | ❌ diam |
+| Penomoran menemukan CKAP PPPK | ✅ (+ teks siap-copas) |
+| Penomoran 0 terisi & tanpa temuan | ❌ diam |
 | Rekap menghasilkan Excel | ✅ |
 | Magang ada pengajuan baru | ✅ |
 | Magang 0 baru | ❌ diam |

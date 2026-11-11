@@ -86,10 +86,11 @@ RECIPES: list[dict] = [
         # Tanpa input: cukup satu tombol "Jalankan", tanpa dialog.
         "inputs": [],
         "needs_vault": True,
-        # Kirim ringkasan ke Telegram, tapi hanya kalau ada nomor terisi/gagal.
+        # Kirim ringkasan ke Telegram, tapi hanya kalau ada nomor terisi,
+        # temuan CKAP PPPK, atau gagal.
         "notify": True,
-        # Tiap 2 jam. Aman diulang: yang sudah bernomor & cuti tahun lalu dilewati.
-        "schedule": "0 */2 * * *",
+        # Tiap 1 jam. Aman diulang: yang sudah bernomor & cuti tahun lalu dilewati.
+        "schedule": "0 * * * *",
     },
     {
         "key": "magang_baru",
@@ -335,6 +336,18 @@ def summarize(key: str, result: dict) -> str:
         if result.get("total"):
             lines.append(f"Σ {result['total']} baris di file")
     if "terisi" in result:
+        # Temuan CKAP PPPK ditulis lebih dulu: ini yang butuh tindakan
+        # (ubah status), bukan sekadar informasi penomoran.
+        for t in result.get("ckap_pppk") or []:
+            lines.append(
+                f"🚫 CKAP oleh {t.get('jenis_asn') or 'PPPK'}: {t.get('nama', '?')}"
+            )
+            lines.append(
+                f"   {t.get('nip', '-')} · status {t.get('status', '?')} · "
+                f"{t.get('tanggal_teks', '-')}"
+            )
+        if result.get("teks_ckap"):
+            lines.append("📋 Teks siap copas dikirim di pesan berikutnya.")
         lines.append(
             f"✍️ Nomor diisi: {result.get('terisi', 0)} · "
             f"dilewati (sudah bernomor): {result.get('dilewati', 0)}"
@@ -393,6 +406,7 @@ def summarize(key: str, result: dict) -> str:
     ringkas_saja = (
         ("created" in result and "updated" in result)
         or "batch_id" in result
+        or ("terisi" in result and "dilewati" in result)
     )
     if result.get("log") and not ringkas_saja:
         lines.append("→ " + " · ".join(result["log"]))
@@ -453,7 +467,13 @@ def notify_recipe(cfg: "Config", key: str, result: dict) -> None:
     elif "batch_id" in result:
         berubah = bool(result.get("jumlah"))
     else:
-        berubah = bool(result.get("terisi") or result.get("xlsx"))
+        # Penomoran juga "berubah" kalau menemukan CKAP milik PPPK: tidak ada
+        # nomor yang diisi, tapi itu justru yang perlu ditindaklanjuti.
+        berubah = bool(
+            result.get("terisi")
+            or result.get("xlsx")
+            or result.get("ckap_pppk")
+        )
     if ok and not berubah:
         return  # tidak ada yang perlu dilaporkan
 
@@ -463,15 +483,29 @@ def notify_recipe(cfg: "Config", key: str, result: dict) -> None:
     # Simpan versi asli (belum di-escape) agar dashboard menampilkan teks yang
     # enak dibaca, sementara Telegram tetap menerima versi ter-escape.
     simpan_notifikasi(cfg, key, text)
+
+    # Teks permintaan ubah status dikirim sebagai pesan TERPISAH dalam <pre>
+    # supaya bisa disalin sekali tap tanpa ikut ringkasan, dan supaya batas
+    # 3800 karakter tidak memotongnya di tengah blok.
+    teks_copas = str(result.get("teks_ckap") or "")
+    potongan: list[str] = []
+    if teks_copas:
+        sisa = teks_copas
+        while sisa:
+            potongan.append(sisa[:3500])
+            sisa = sisa[3500:]
+
     # Pesan dikirim dengan parse_mode=HTML; escape agar nama/error yang
     # mengandung <, >, atau & tidak membuat Telegram menolak pesannya.
-    text = html.escape(text)
+    pesan = [html.escape(text)]
+    pesan.extend(f"<pre>{html.escape(p)}</pre>" for p in potongan)
     # Notifikasi tidak boleh menggagalkan recipe: kegagalan kirim cukup dicatat.
     for chat_id in cfg.telegram_allowed:
-        try:
-            telegram_client.send_message(cfg, chat_id, text)
-        except Exception:  # noqa: BLE001
-            pass
+        for badan in pesan:
+            try:
+                telegram_client.send_message(cfg, chat_id, badan)
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def run_logged(conn: sqlite3.Connection, key: str, fn: Callable[[], dict]) -> dict:
