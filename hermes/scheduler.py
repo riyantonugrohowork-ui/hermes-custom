@@ -83,14 +83,21 @@ def due_recipes(conn: sqlite3.Connection, now: datetime | None = None) -> list[d
     out: list[dict] = []
     for meta in recipes.RECIPES:
         key = meta["key"]
-        schedule = recipes.schedule_of(meta)
-        if not schedule:
+        # Satu recipe bisa punya beberapa jendela jadwal (mis. absen hadir pagi
+        # dan pulang sore). Yang menentukan: kemunculan TERAKHIR dari gabungan
+        # semuanya, dibandingkan dengan waktu jalan terakhir.
+        jadwal = recipes.schedules_of(meta)
+        if not jadwal:
             continue
-        try:
-            scheduled = cron.prev_run(schedule, now)
-        except cron.CronError:
-            log.warning("Jadwal recipe %s tidak valid: %r", key, schedule)
+        terjadwal = []
+        for spec in jadwal:
+            try:
+                terjadwal.append(cron.prev_run(spec, now))
+            except cron.CronError:
+                log.warning("Jadwal recipe %s tidak valid: %r", key, spec)
+        if not terjadwal:
             continue
+        scheduled = max(terjadwal)
         last = _recipe_last_run(conn, key)
         if last is not None and last >= scheduled:
             continue  # kemunculan terakhir sudah dijalankan

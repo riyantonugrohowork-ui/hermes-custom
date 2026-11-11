@@ -26,6 +26,7 @@ Perintah:
   /tasks — daftar task
   /status — status provider & config
   /lanjut <task_id> — setujui rencana yang menunggu konfirmasi
+  /absen [hadir|pulang] — cek presensi harian (baca saja)
 """
 
 
@@ -48,6 +49,18 @@ def handle_update(cfg: "Config", conn: sqlite3.Connection, update: dict) -> None
 
     if not text:
         return
+
+    # Jawaban captcha absen: saat resep absen sedang menunggu, teks bebas
+    # diperlakukan sebagai kode captcha — user cukup membalas karakternya, tidak
+    # perlu perintah. Ini harus diperiksa SEBELUM routing teks bebas, karena
+    # kalau tidak balasannya malah dibuatkan task baru.
+    if not text.startswith("/"):
+        from . import recipe_absen
+
+        if recipe_absen.pending_aktif(conn):
+            recipe_absen.tulis_jawaban(conn, text.strip())
+            tg.send_message(cfg, chat_id, f"🔑 Jawaban captcha diterima: <b>{text.strip()}</b>")
+            return
 
     if text.startswith("/start") or text.startswith("/help"):
         tg.send_message(cfg, chat_id, HELP)
@@ -81,6 +94,21 @@ def handle_update(cfg: "Config", conn: sqlite3.Connection, update: dict) -> None
             tg.send_message(cfg, chat_id, "Tidak ada rencana yang menunggu konfirmasi untuk task itu.")
             return
         tg.send_message(cfg, chat_id, runner.summarize_result(result))
+        return
+
+    if text.startswith("/absen"):
+        # Cek presensi manual. Kalau sesi absen sudah mati, captcha dikirim ke
+        # chat ini dan jawabannya dibaca dari sini juga.
+        from . import recipes
+
+        sesi = ""
+        bagian = text.split()
+        if len(bagian) > 1 and bagian[1].lower() in ("hadir", "pulang"):
+            sesi = bagian[1].lower()
+        tg.send_message(cfg, chat_id, "🔎 Memeriksa presensi…")
+        result = recipes.run_recipe(cfg, conn, "absen_cek",
+                                   {"sesi_shift": sesi} if sesi else {})
+        tg.send_message(cfg, chat_id, recipes.summarize("absen_cek", result))
         return
 
     # ---- instruksi bebas -> buat task & jalankan ----

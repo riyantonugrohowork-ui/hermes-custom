@@ -24,6 +24,28 @@ def send_message(cfg: "Config", chat_id: int, text: str) -> dict:
         return {"ok": False, "error": str(e)}
 
 
+def send_photo(
+    cfg: "Config", chat_id: int, data: bytes,
+    caption: str = "", filename: str = "captcha.png",
+) -> dict:
+    """Kirim gambar dari memori (tanpa menulis berkas sementara).
+
+    Dipakai captcha absen: gambarnya harus persis yang terikat pada sesi HTTP
+    pengirim, jadi tidak boleh lewat disk lalu diunggah ulang.
+    """
+    try:
+        r = requests.post(
+            API.format(token=cfg.telegram_bot_token, method="sendPhoto"),
+            data={"chat_id": chat_id, "caption": caption},
+            files={"photo": (filename, data, "image/png")},
+            timeout=60,
+        )
+        r.raise_for_status()
+        return {"ok": True}
+    except requests.RequestException as e:
+        return {"ok": False, "error": str(e)}
+
+
 def send_document(cfg: "Config", chat_id: int, path: str, caption: str = "") -> dict:
     try:
         with open(path, "rb") as f:

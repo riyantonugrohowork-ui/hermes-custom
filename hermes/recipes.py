@@ -193,6 +193,83 @@ RECIPES: list[dict] = [
         # Minggu 23:00: bersihkan setelah semua alur mingguan selesai.
         "schedule": "0 23 * * 0",
     },
+    {
+        "key": "ekin_harian",
+        "title": "Aktivitas Harian e-Kinerja",
+        "description": (
+            "Sapu Aktivitas Harian e-Kinerja, simpan ke database, lalu "
+            "laporkan hari kerja yang belum diisi atau kurang dari 420 menit."
+        ),
+        "triggers": ["aktivitas harian", "skp harian", "e-kin", "e-kinerja"],
+        "steps": [
+            "Login SIMPATIK (Bitwarden)",
+            "Ambil token e-kin",
+            "Sapu tabel Aktivitas Harian",
+            "Simpan ke database",
+            "Hitung capaian per hari & bulan",
+        ],
+        # Tanpa input: cukup satu tombol "Jalankan".
+        "inputs": [],
+        "needs_vault": True,
+        # Hanya kirim kalau ada hari kosong / di bawah target / gagal.
+        "notify": True,
+        # Pagi sebelum 08.00 dan sore sesudah 15.00 — di luar jam input e-kin.
+        "schedule": "0 7,16 * * *",
+    },
+    {
+        "key": "ekin_kirim",
+        "title": "Kirim Isian e-Kinerja ke SIMPATIK",
+        "description": (
+            "Kirim isian aktivitas yang disiapkan di tab Kinerja ke SIMPATIK. "
+            "Isian bisa diisi kapan saja; pengiriman berjalan sesudah jam 15.00."
+        ),
+        "triggers": ["kirim e-kin", "input e-kinerja", "simpatik e-kin"],
+        "steps": [
+            "Ambil isian tertunda dari database",
+            "Login SIMPATIK (Bitwarden)",
+            "Isi form Aktivitas Harian per butir",
+            "Sapu ulang tabel & tandai yang sudah masuk",
+        ],
+        "inputs": [],
+        "needs_vault": True,
+        # Diam kalau tidak ada isian tertunda.
+        "notify": True,
+        # Sesudah 15.00, saat e-kin menerima input.
+        "schedule": "0 15 * * *",
+    },
+    {
+        "key": "absen_cek",
+        "title": "Cek Presensi Harian (absen.semarangkota.go.id)",
+        "description": (
+            "Cek presensi harian ASN DPMPTSP di absen.semarangkota.go.id. "
+            "BACA SAJA: tidak pernah mengisi atau menghapus absen. "
+            "Lapor ke Telegram hanya kalau masih ada yang belum absen."
+        ),
+        "triggers": ["cek absen", "presensi harian", "absen pagi", "absen pulang"],
+        "steps": [
+            "Login absen (captcha dijawab lewat Telegram bila sesi habis)",
+            "Ambil token OPD di Rekap Harian",
+            "Baca jam kerja tanggal ini",
+            "Baca rekap presensi ASN satu OPD",
+            "Laporkan yang masih belum absen",
+        ],
+        "inputs": [
+            {
+                "name": "sesi_shift",
+                "label": "Sesi",
+                "type": "text",
+                "required": False,
+                "help": "hadir (pagi) atau pulang (sore). Kosongkan untuk otomatis menurut jam.",
+            },
+        ],
+        "needs_vault": True,
+        # Diam kalau semua sudah absen: yang sudah absen tidak pernah
+        # dilaporkan ulang, jadi run berikutnya tidak jadi spam.
+        "notify": True,
+        # 07:50 & 07:55 untuk kehadiran; 16:01 & 16:06 untuk kepulangan.
+        "schedule": "50,55 7 * * 1-5",
+        "schedule_extra": ["1,6 16 * * 1-5"],
+    },
 ]
 
 _BY_KEY = {r["key"]: r for r in RECIPES}
@@ -222,6 +299,19 @@ def schedule_of(recipe: dict) -> str | None:
         return pattern.format(hour=int(hour), minute=int(minute or 0))
     except (ValueError, KeyError):
         return None
+
+
+def schedules_of(recipe: dict) -> list[str]:
+    """Semua jadwal recipe.
+
+    Satu recipe kadang perlu dua jendela berbeda yang tidak bisa ditulis dalam
+    satu ekspresi cron — mis. cek absen hadir 07:50 & 07:55 lalu pulang 16:01 &
+    16:06. `schedule_extra` menampung jendela tambahannya.
+    """
+    utama = schedule_of(recipe)
+    if not utama:
+        return []
+    return [utama, *(recipe.get("schedule_extra") or [])]
 
 
 def runs_on_start(recipe: dict) -> bool:
@@ -298,6 +388,18 @@ def execute(cfg: "Config", key: str, inputs: dict) -> dict:
         return recipe_pegawai.run_pegawai(
             cfg, kd_skpd=str(inputs.get("kd_skpd") or "")
         )
+    if key == "ekin_harian":
+        from . import recipe_ekin
+
+        return recipe_ekin.run_ekin(cfg)
+    if key == "ekin_kirim":
+        from . import recipe_ekin
+
+        return recipe_ekin.kirim_rencana(cfg)
+    if key == "absen_cek":
+        from . import recipe_absen
+
+        return recipe_absen.cek_presensi(cfg, sesi_shift=str(inputs.get("sesi_shift") or ""))
     raise KeyError(f"Recipe '{key}' tidak punya pelaksana.")
 
 
@@ -380,6 +482,50 @@ def summarize(key: str, result: dict) -> str:
         )
         if result.get("durasi_detik"):
             lines.append(f"⏱️ {result['durasi_detik']} detik")
+    if "target_bulanan" in result:
+        # Aktivitas harian e-Kinerja: hari kosong & hari di bawah target adalah
+        # inti laporannya — itu yang perlu diisi, bukan jumlah baris tersimpan.
+        lines.append(
+            f"📊 {result.get('bulan')} · "
+            f"{result.get('total_menit', 0)}/{result.get('target_bulanan', 0)} menit"
+        )
+        if result.get("kurang_bulanan"):
+            lines.append(f"· kurang {result['kurang_bulanan']} menit dari target bulanan")
+        for d in (result.get("belum") or [])[:20]:
+            lines.append(f"❌ {d['tanggal']} ({d['hari']}) belum diisi")
+        if len(result.get("belum") or []) > 20:
+            lines.append(f"   … {len(result['belum']) - 20} hari lain belum diisi")
+        for d in (result.get("kurang") or [])[:20]:
+            lines.append(
+                f"⚠️ {d['tanggal']} ({d['hari']}) {d['menit']} menit "
+                f"— kurang {d['kurang']}"
+            )
+        if not result.get("belum") and not result.get("kurang"):
+            lines.append("✅ Semua hari kerja sudah memenuhi target harian")
+    if "sudah_absen" in result:
+        # Cek presensi absen.semarangkota.go.id — khusus Riyanto Nugroho.
+        nama = result.get("nama") or "Pegawai"
+        if result.get("sudah_absen"):
+            lines.append(f"✅ {nama} sudah absen "
+                         f"{result.get('shift', '').upper()} ({result.get('jam') or '-'}) "
+                         f"· {result.get('tanggal')}")
+        else:
+            lines.append(f"⚠️ {nama} {result.get('label')} · {result.get('tanggal')}")
+            lines.append(f"· NIP {result.get('nip')}")
+            if result.get("opd"):
+                lines.append(f"· {result['opd']}")
+            lines.append("Silakan absen di https://absen.semarangkota.go.id")
+    if "dikirim" in result:
+        # Kirim isian ke SIMPATIK: yang penting berapa yang masuk & berapa sisa.
+        lines.append(
+            f"📤 Terkirim {result.get('dikirim', 0)} butir ke SIMPATIK"
+        )
+        if result.get("gagal"):
+            lines.append(f"⚠️ Gagal {result['gagal']} butir")
+        if result.get("sisa"):
+            lines.append(f"· sisa tertunda {result['sisa']} butir")
+        for d in (result.get("detail_gagal") or [])[:10]:
+            lines.append(f"❌ {d['tanggal']} {d['uraian'][:40]} — {d['error'][:90]}")
     if "batch_id" in result:
         lines.append(
             f"🗂️ Batch DUK #{result.get('batch_id')}: "
@@ -406,6 +552,7 @@ def summarize(key: str, result: dict) -> str:
     ringkas_saja = (
         ("created" in result and "updated" in result)
         or "batch_id" in result
+        or "target_bulanan" in result
         or ("terisi" in result and "dilewati" in result)
     )
     if result.get("log") and not ringkas_saja:
@@ -460,6 +607,18 @@ def notify_recipe(cfg: "Config", key: str, result: dict) -> None:
     # dan pembersihan hanya berarti kalau benar-benar ada berkas yang dihapus.
     if "total_pengajuan" in result:
         berubah = bool(result.get("baru"))
+    elif "sudah_absen" in result:
+        # Cek presensi: hanya berubah kalau target BELUM absen. Yang sudah absen
+        # tidak boleh dilaporkan ulang — jadwalnya dua kali berturut-turut
+        # (07:50 & 07:55), jadi tanpa gate ini selalu dobel.
+        berubah = not bool(result.get("sudah_absen"))
+    elif "dikirim" in result:
+        # Kirim isian ke SIMPATIK: diam kalau memang tidak ada yang dikirim.
+        berubah = bool(result.get("dikirim") or result.get("gagal"))
+    elif "target_bulanan" in result:
+        # Aktivitas harian jalan 2x sehari; kalau semua hari sudah memenuhi
+        # target, tidak ada yang perlu diberitahukan.
+        berubah = bool(result.get("belum") or result.get("kurang"))
     elif "retensi_hari" in result:
         berubah = bool(result.get("dihapus"))
     elif "created" in result and "updated" in result:

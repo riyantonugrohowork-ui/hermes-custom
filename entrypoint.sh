@@ -58,6 +58,16 @@ else
   echo "ℹ️  Autopilot nonaktif — recipe hanya jalan manual."
 fi
 
+# 3b. Bot Telegram: WAJIB jalan agar balasan captcha (absen) dan perintah
+#     /absen terbaca. Tanpa ini captcha terkirim tapi jawabannya tidak pernah
+#     sampai — captcha absen dijawab manusia lewat chat.
+if [ -n "$TELEGRAM_BOT_TOKEN" ]; then
+  echo "💬 Bot Telegram aktif (polling)."
+  python -m hermes telegram &
+else
+  echo "ℹ️  TELEGRAM_BOT_TOKEN kosong — bot Telegram tidak dijalankan."
+fi
+
 # 4. Start web UI (foreground, port 10000).
 echo "🌐 Menghidupkan web UI di port ${HERMES_WEB_PORT:-10000}..."
 exec python -m hermes web

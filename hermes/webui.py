@@ -13,7 +13,7 @@ import json
 import logging
 import sqlite3
 import threading
-from datetime import datetime
+from datetime import date, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, urlparse
@@ -200,6 +200,7 @@ PAGE = r"""<!doctype html>
     <nav>
       <button data-v="dash" class="active">Dashboard</button>
       <button data-v="rec">Alur</button>
+      <button data-v="kinerja">Kinerja</button>
       <button data-v="notif">Notifikasi</button>
       <button data-v="log">Log</button>
     </nav>
@@ -241,6 +242,18 @@ PAGE = r"""<!doctype html>
       </div>
     </section>
 
+    <!-- ================= KINERJA (e-Kinerja) ================= -->
+    <section class="view" id="v-kinerja">
+      <div class="pad">
+        <div class="panel">
+          <h3>Tanggal belum terisi bulan ini</h3>
+          <div id="kinstats" class="stats" style="margin-bottom:14px"></div>
+          <div id="kinkirim" style="margin-bottom:14px"></div>
+          <div id="kinhari"></div>
+        </div>
+      </div>
+    </section>
+
     <!-- ================= NOTIFIKASI ================= -->
     <section class="view" id="v-notif">
       <div class="pad">
@@ -278,6 +291,7 @@ document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
   $('#v-'+b.dataset.v).classList.add('active');
   if (b.dataset.v === 'dash') loadDash();
   if (b.dataset.v === 'rec') loadDash();
+  if (b.dataset.v === 'kinerja') loadKinerja();
   if (b.dataset.v === 'notif') loadNotif();
   if (b.dataset.v === 'log') loadLogs();
 });
@@ -331,6 +345,198 @@ async function loadDash(){
 
   renderRecipes();
   renderNotif('#dashnotif', (d.notifications||[]).slice(0,3), 3);
+}
+
+/* ---------- kinerja (e-Kinerja) ---------- */
+let KIN = {};
+let KINEDIT = {};   // tanggal -> [{uraian, catatan, kuantitas}]
+
+const APEL = 'Mengikuti apel pagi';
+
+function butirOpts(sel, dipakai){
+  const list = (KIN.butir || []).filter(b => !(dipakai || []).includes(b.nama));
+  return list.map(b => {
+    const v = esc(b.nama);
+    return `<option value="${v}"${b.nama === sel ? ' selected' : ''}>${v} (${b.waktu} menit)</option>`;
+  }).join('');
+}
+
+function sudahAda(tanggal){
+  const h = (KIN.per_hari || []).find(x => x.tanggal === tanggal);
+  return (h && h.sudah_ada) || [];
+}
+
+// Butir default hari itu: apel pagi — kecuali sudah tercatat di e-kin.
+function barisKosong(tanggal){
+  const ada = sudahAda(tanggal);
+  const pertama = (KIN.butir || []).find(b => !ada.includes(b.nama));
+  return { uraian: ada.includes(APEL) ? (pertama ? pertama.nama : '') : APEL,
+           catatan: '', kuantitas: 1 };
+}
+
+function putarIsian(tanggal){
+  const h = (KIN.per_hari || []).find(x => x.tanggal === tanggal);
+  if (!h) return [];
+  return (h.butir_isian || []).map(b => ({
+    uraian: b.uraian, catatan: b.catatan || '', kuantitas: b.kuantitas || 1,
+    status: b.status || 'pending', error: b.error || '',
+  }));
+}
+
+function menitButir(nama){
+  const b = (KIN.butir || []).find(x => x.nama === nama);
+  return b ? b.waktu : 0;
+}
+
+function menitTanggal(tanggal){
+  const list = KINEDIT[tanggal] || [];
+  return list.reduce((t, x) => t + menitButir(x.uraian) * (x.kuantitas || 1), 0);
+}
+
+function renderIsian(tanggal){
+  const list = KINEDIT[tanggal] || [];
+  const tbody = document.querySelector(`[data-rows="${tanggal}"]`);
+  if (!tbody) return;
+  const ada = sudahAda(tanggal);
+  tbody.innerHTML = list.map((x, i) => `<tr>
+    <td><select data-f="uraian" data-tgl="${tanggal}" data-i="${i}"
+        onchange="ubahBaris(this)">${butirOpts(x.uraian, ada)}</select></td>
+    <td><input data-f="catatan" data-tgl="${tanggal}" data-i="${i}"
+        value="${esc(x.catatan)}" placeholder="opsional" oninput="ubahBaris(this)"></td>
+    <td style="width:90px"><input type="number" min="1" data-f="kuantitas"
+        data-tgl="${tanggal}" data-i="${i}" value="${x.kuantitas}"
+        oninput="ubahBaris(this)"></td>
+    <td style="width:90px;color:var(--dim)">${menitButir(x.uraian) * (x.kuantitas || 1)}</td>
+    <td style="width:70px">${x.status === 'sent'
+        ? '<span class="pill ok">terkirim</span>'
+        : x.status === 'error'
+        ? `<span class="pill err" title="${esc(x.error)}">gagal</span>`
+        : '<span class="pill pending">antri</span>'}</td>
+    <td style="width:40px;text-align:right"><a href="#" title="hapus baris"
+        onclick="hapusBaris('${tanggal}',${i});return false">×</a></td>
+  </tr>`).join('') + `<tr><td colspan="6">
+      <a href="#" onclick="tambahBaris('${tanggal}');return false">+ tambah baris</a>
+      <span style="float:right;color:var(--dim)" id="total-${tanggal}"></span></td></tr>`;
+  const total = document.getElementById('total-' + tanggal);
+  if (total) total.textContent = `${menitTanggal(tanggal)} menit`;
+}
+
+function ubahBaris(el){
+  const { tgl, i, f } = el.dataset;
+  const list = KINEDIT[tgl];
+  if (!list || !list[i]) return;
+  list[i][f] = f === 'kuantitas' ? Math.max(1, Number(el.value || 1)) : el.value;
+  const total = document.getElementById('total-' + tgl);
+  if (total) total.textContent = `${menitTanggal(tgl)} menit`;
+}
+
+function tambahBaris(tanggal){
+  (KINEDIT[tanggal] = KINEDIT[tanggal] || []).push(barisKosong());
+  renderIsian(tanggal);
+}
+
+function hapusBaris(tanggal, i){
+  (KINEDIT[tanggal] || []).splice(i, 1);
+  renderIsian(tanggal);
+}
+
+async function simpanIsian(tanggal, btn){
+  const baris = (KINEDIT[tanggal] || []).filter(x => x.uraian);
+  btn.disabled = true;
+  try{
+    const r = await fetch('/api/kinerja/isian', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ tanggal, baris })
+    });
+    const d = await r.json();
+    const box = document.getElementById('msg-' + tanggal);
+    if (box){ box.textContent = d.reply || ''; box.style.color = d.ok ? 'var(--ok)' : 'var(--err)'; }
+    if (d.ok) loadKinerja();
+  } finally { btn.disabled = false; }
+}
+
+async function hapusIsian(tanggal){
+  if (!confirm('Hapus semua isian tanggal ' + tanggal + '?')) return;
+  await fetch('/api/kinerja/isian/' + tanggal + '/hapus', {method:'POST'});
+  loadKinerja();
+}
+
+async function kirimSekarang(btn){
+  btn.disabled = true;
+  const box = document.getElementById('kinmsg');
+  if (box){ box.textContent = 'Mengirim…'; box.style.color = 'var(--dim)'; }
+  try{
+    const r = await fetch('/api/kinerja/kirim', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body: '{}'
+    });
+    const d = await r.json();
+    if (box){ box.textContent = d.reply || ''; box.style.color = d.ok ? 'var(--ok)' : 'var(--warn)'; }
+    if (d.ok) setTimeout(loadKinerja, 1500);
+  } finally { btn.disabled = false; }
+}
+
+async function loadKinerja(){
+  const d = await fetch('/api/kinerja').then(r => r.json());
+  KIN = d;
+  KINEDIT = {};
+
+  const s = d.ringkasan || {};
+  const hari = d.per_hari || [];
+  const kurangMenit = hari.reduce((t, h) => t + h.kurang, 0);
+  $('#kinstats').innerHTML =
+    statCard('Perlu diisi', hari.length, `hari kerja s/d ${d.batas||'—'}`, hari.length?'warn':'ok') +
+    statCard('Kekurangan', kurangMenit, 'menit total') +
+    statCard('Target harian', d.target_harian||0, 'menit') +
+    statCard('Target bulanan', d.target_bulanan||0, 'menit') +
+    statCard('Tersimpan di e-kin', s.baris||0, `${s.hari||0} hari`);
+
+  if (!hari.length){
+    $('#kinhari').innerHTML = '<div class="empty">Semua hari kerja bulan ini sudah memenuhi target.</div>';
+  }
+
+  const tertunda = d.tertunda || 0;
+  $('#kinkirim').innerHTML = `<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+      <button class="run" onclick="kirimSekarang(this)" ${tertunda ? '' : 'disabled'}>
+        📤 Kirim ke SIMPATIK${tertunda ? ` (${tertunda} butir)` : ''}</button>
+      <span style="font-size:12px;color:var(--dim)">
+        ${tertunda
+          ? `${tertunda} butir siap dikirim. `
+          : 'Belum ada isian yang menunggu dikirim. '}
+        ${d.jendela_buka
+          ? 'Jendela input e-Kinerja sedang terbuka (sebelum 08.00 / sesudah 15.00).'
+          : 'Di luar jam input e-Kinerja — isian disimpan dulu, terkirim otomatis jam 15.00.'}
+      </span>
+    </div>
+    <div id="kinmsg" style="font-size:12px;margin-top:6px"></div>`;
+
+  if (!hari.length) return;
+
+  $('#kinhari').innerHTML = hari.map(h => {
+    KINEDIT[h.tanggal] = putarIsian(h.tanggal);
+    if (!KINEDIT[h.tanggal].length) KINEDIT[h.tanggal].push(barisKosong());
+    const ket = h.menit > 0
+      ? `terisi ${h.menit} menit · kurang ${h.kurang}`
+      : 'belum diisi';
+    return `<div class="rec">
+      <div class="head">
+        <span class="name">${esc(h.tanggal)}</span>
+        <span class="sched">${esc(h.hari)}</span>
+        <span class="pill ${h.menit > 0 ? 'partial' : 'err'}">${esc(ket)}</span>
+        <button class="run" style="margin-left:auto"
+          onclick="simpanIsian('${h.tanggal}', this)">💾 Simpan</button>
+        ${h.isian ? `<button class="run" onclick="hapusIsian('${h.tanggal}')">Hapus</button>` : ''}
+      </div>
+      <div class="body">
+        <table style="margin-top:6px">
+          <thead><tr><th>Butir kegiatan</th><th>Catatan</th><th>Kuantitas</th><th>Menit</th><th>Status</th><th></th></tr></thead>
+          <tbody data-rows="${h.tanggal}"></tbody>
+        </table>
+        <div id="msg-${h.tanggal}" style="font-size:12px;margin-top:6px"></div>
+      </div>
+    </div>`;
+  }).join('');
+
+  hari.forEach(h => renderIsian(h.tanggal));
 }
 
 /* ---------- notifikasi (pesan Telegram) ---------- */
@@ -604,6 +810,162 @@ def _dashboard(state: _State) -> dict:
         conn.close()
 
 
+def _norm_uraian(teks: str) -> str:
+    """Bentuk pembanding uraian: huruf kecil, spasi dirapatkan."""
+    return " ".join((teks or "").casefold().split())
+
+
+def _kinerja(state: _State) -> dict:
+    """Tab Kinerja: tanggal bulan ini yang BELUM terisi, plus isiannya.
+
+    Yang dikirim hanya hari kerja bulan berjalan sampai `batas_periksa()`.
+    Tiap tanggal membawa `sudah_ada` — butir yang sudah tercatat di e-kin pada
+    tanggal itu — supaya tidak ditawarkan lagi (apel pagi paling sering dobel).
+    """
+    from . import ekin_butir, recipe_ekin
+
+    conn = _get_conn(state)
+    try:
+        akun = recipe_ekin.BW_USER
+        sampai = recipe_ekin.batas_periksa()
+        mulai = recipe_ekin.awal_bulan(sampai)
+        terisi = db.total_harian_ekin(conn, mulai.isoformat(), sampai.isoformat())
+        isian = {r["tanggal"]: r for r in db.tanggal_rencana_ekin(conn, akun)}
+        tercatat = db.uraian_harian_ekin(conn, mulai.isoformat(), sampai.isoformat())
+        katalog = {_norm_uraian(b["nama"]): b["nama"] for b in ekin_butir.BUTIR}
+
+        hari = []
+        for d in recipe_ekin.hari_kerja(mulai, sampai):
+            kunci = d.isoformat()
+            menit = int(terisi.get(kunci) or 0)
+            if menit >= recipe_ekin.TARGET_HARIAN:
+                continue  # sudah cukup di e-kin — tidak perlu diisi lagi
+            sudah_ada = [
+                katalog[_norm_uraian(u)]
+                for u in tercatat.get(kunci, [])
+                if _norm_uraian(u) in katalog
+            ]
+            siap = isian.get(kunci) or {}
+            hari.append({
+                "tanggal": kunci,
+                "hari": recipe_ekin.NAMA_HARI[d.weekday()],
+                "menit": menit,
+                "kurang": recipe_ekin.TARGET_HARIAN - menit,
+                "status": "kosong" if menit <= 0 else "kurang",
+                "isian": siap.get("butir", 0),
+                "isian_menit": siap.get("menit", 0),
+                "sudah_ada": sudah_ada,
+                "butir_isian": db.rencana_per_tanggal(conn, akun, kunci),
+            })
+
+        return {
+            "ringkasan": db.ringkasan_ekin(conn),
+            "per_hari": hari,
+            "butir": ekin_butir.BUTIR,
+            "target_bulanan": recipe_ekin.TARGET_BULANAN,
+            "target_harian": recipe_ekin.TARGET_HARIAN,
+            "batas": sampai.isoformat(),
+            "jendela_buka": recipe_ekin.jendela_input_buka(),
+            "tertunda": len(db.rencana_pending(conn, akun, sampai.isoformat())),
+        }
+    finally:
+        conn.close()
+
+
+def _simpan_isian(state: _State, payload: dict) -> dict:
+    """Ganti isian satu tanggal dengan daftar butir yang dikirim."""
+    from . import ekin_butir, recipe_ekin
+
+    tanggal = str(payload.get("tanggal") or "").strip()
+    baris = payload.get("baris") or []
+    if not isinstance(baris, list):
+        return {"ok": False, "reply": "Format isian tidak dikenal."}
+    try:
+        datetime.strptime(tanggal, "%Y-%m-%d")
+    except ValueError:
+        return {"ok": False, "reply": "Format tanggal harus YYYY-MM-DD."}
+
+    conn = _get_conn(state)
+    try:
+        # Butir yang sudah tercatat di e-kin pada tanggal itu dibuang: mencatat
+        # ulang apel pagi akan menggandakan menit di e-kin.
+        tercatat = {
+            _norm_uraian(u)
+            for u in db.uraian_harian_ekin(conn, tanggal, tanggal).get(tanggal, [])
+        }
+        bersih = []
+        for b in baris:
+            butir = ekin_butir.cari(str(b.get("uraian") or ""))
+            if butir is None:
+                continue  # butir harus dari daftar; nama bebas tidak disimpan
+            if _norm_uraian(butir["nama"]) in tercatat:
+                continue  # sudah ada di e-kin
+            try:
+                qty = max(1, int(b.get("kuantitas") or 1))
+            except (TypeError, ValueError):
+                qty = 1
+            bersih.append({
+                "uraian": butir["nama"],
+                "catatan": str(b.get("catatan") or "").strip(),
+                "kuantitas": qty,
+                "satuan": int(butir["waktu"]),
+            })
+        jumlah = db.isi_rencana_ekin(conn, recipe_ekin.BW_USER, tanggal, bersih)
+    finally:
+        conn.close()
+
+    if not jumlah:
+        return {"ok": True, "reply": f"Isian {tanggal} dikosongkan."}
+    menit = sum(x["satuan"] * x["kuantitas"] for x in bersih)
+    return {"ok": True, "reply": f"Isian {tanggal}: {jumlah} butir · {menit} menit."}
+
+
+def _hapus_isian(state: _State, tanggal: str) -> dict:
+    from . import recipe_ekin
+
+    conn = _get_conn(state)
+    try:
+        n = db.hapus_rencana_tanggal(conn, recipe_ekin.BW_USER, tanggal)
+    finally:
+        conn.close()
+    return {"ok": n > 0, "reply": f"Isian {tanggal} dihapus." if n else "Tidak ada isian."}
+
+
+def _kirim_sekarang(state: _State, payload: dict) -> dict:
+    """Kirim isian tertunda ke SIMPATIK sekarang (tombol, di luar jadwal 15.00).
+
+    e-kin hanya menerima input sebelum 08.00 atau sesudah 15.00, jadi tombol ini
+    menolak di luar jendela itu — lebih baik menolak daripada mengisi form yang
+    akan ditolak server.
+    """
+    from . import recipe_ekin
+
+    paksa = bool(payload.get("paksa"))
+    if not paksa and not recipe_ekin.jendela_input_buka():
+        return {
+            "ok": False,
+            "reply": (
+                "⏳ e-Kinerja hanya menerima input sebelum 08.00 atau sesudah 15.00. "
+                "Isian tersimpan di antrian dan otomatis dikirim jam 15.00."
+            ),
+        }
+
+    conn = _get_conn(state)
+    try:
+        tertunda = db.rencana_pending(conn, recipe_ekin.BW_USER, date.today().isoformat())
+    finally:
+        conn.close()
+    if not tertunda:
+        return {"ok": False, "reply": "Tidak ada isian tertunda."}
+
+    hasil = _start_recipe(state.cfg, "ekin_kirim", {})
+    jumlah = len(tertunda)
+    if hasil.get("ok"):
+        return {"ok": True, "pending": True,
+                "reply": f"📤 Mengirim {jumlah} butir ke SIMPATIK…"}
+    return hasil
+
+
 def _notifications(conn: sqlite3.Connection, limit: int = 100) -> list[dict]:
     """Pesan yang benar-benar dikirim ke Telegram (dicatat saat kirim).
 
@@ -690,6 +1052,13 @@ class Handler(BaseHTTPRequestHandler):
                 log.exception("Gagal memuat dashboard")
                 self._json(500, {"error": f"{type(e).__name__}: {e}"})
             return
+        if path == "/api/kinerja":
+            try:
+                self._json(200, _kinerja(self.state))
+            except Exception as e:  # noqa: BLE001
+                log.exception("Gagal memuat tab Kinerja")
+                self._json(500, {"error": f"{type(e).__name__}: {e}"})
+            return
         if path == "/api/notifications":
             conn = _get_conn(self.state)
             try:
@@ -723,6 +1092,18 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._json(404, {"error": "not found"})
 
+    def _body(self) -> dict:
+        """Body JSON permintaan (objek kosong bila tidak ada/tidak sah)."""
+        length = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(length) if length else b""
+        if not raw:
+            return {}
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
     def do_POST(self):  # noqa: N802
         if not self._authorized():
             self._deny()
@@ -731,21 +1112,31 @@ class Handler(BaseHTTPRequestHandler):
         # Jalankan alur dari dashboard: POST /api/recipes/<key>/run
         if path.startswith("/api/recipes/") and path.endswith("/run"):
             key = path.strip("/").split("/")[2]
-            length = int(self.headers.get("Content-Length", 0))
-            raw = self.rfile.read(length) if length else b""
-            inputs = {}
-            if raw:
-                try:
-                    payload = json.loads(raw.decode("utf-8"))
-                    if isinstance(payload, dict):
-                        inputs = payload.get("inputs") or {}
-                except json.JSONDecodeError:
-                    inputs = {}
+            inputs = self._body().get("inputs") or {}
             try:
                 self._json(200, _start_recipe(self.state.cfg, key, inputs))
             except Exception as e:  # noqa: BLE001
                 log.exception("Gagal menjalankan alur %s", key)
                 self._json(500, {"reply": f"⚠️ {type(e).__name__}: {e}"})
+            return
+        # Isian aktivitas per tanggal (tab Kinerja)
+        if path == "/api/kinerja/isian":
+            try:
+                self._json(200, _simpan_isian(self.state, self._body()))
+            except Exception as e:  # noqa: BLE001
+                log.exception("Gagal menyimpan isian")
+                self._json(500, {"ok": False, "reply": f"⚠️ {type(e).__name__}: {e}"})
+            return
+        if path.startswith("/api/kinerja/isian/") and path.endswith("/hapus"):
+            bagian = path.strip("/").split("/")
+            self._json(200, _hapus_isian(self.state, bagian[3]))
+            return
+        if path == "/api/kinerja/kirim":
+            try:
+                self._json(200, _kirim_sekarang(self.state, self._body()))
+            except Exception as e:  # noqa: BLE001
+                log.exception("Gagal mengirim isian ke SIMPATIK")
+                self._json(500, {"ok": False, "reply": f"⚠️ {type(e).__name__}: {e}"})
             return
         self._json(404, {"error": "not found"})
 

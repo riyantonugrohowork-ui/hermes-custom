@@ -5,6 +5,10 @@ secrets/
 # Kredensial runtime — perlakukan seperti password.
 data/bw-config/
 data/magang_seen.json
+# Cookie sesi portal: login absen & SIMPATIK. Siapa pun yang memegang berkas ini
+# bisa memakai sesi yang sudah terbuka, jadi jangan pernah masuk repo.
+data/absen_session.json
+data/*_session.json
 
 # Python
 __pycache__/
@@ -14,6 +18,8 @@ __pycache__/
 
 # Hermes runtime
 data/*.sqlite
+data/*.sqlite-journal
+data/*.sqlite-wal
 output/
 logs/
 

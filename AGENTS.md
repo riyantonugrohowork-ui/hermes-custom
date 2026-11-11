@@ -37,8 +37,11 @@ hermes/
   duk_parse.py        parser HTML DUK (tabel → baris, murni)
   sisdm_pegawai.py    parser HTML SISDM (profil + riwayat, murni)
   recipe_bersih.py    pembersih berkas lama di output/
+  recipe_ekin.py      alur aktivitas harian e-Kinerja (sapu → simpan → lapor)
+  ekin_parse.py       parser HTML Aktivitas Harian e-kin (tabel → baris, murni)
+  ekin_butir.py       daftar butir kegiatan e-kin + menitnya (data murni)
   webui.py            dashboard (http.server bawaan, tanpa dependency)
-  db.py               skema SQLite (notes, records, logs, recipe_state)
+  db.py               skema SQLite (notes, records, logs, recipe_state, ekin_*)
   tasks.py            model Task lama (instruksi + jadwal + Plan)
   telegram_client.py  kirim pesan Telegram
   telegram_bot.py     bot interaktif
@@ -180,6 +183,101 @@ entri di situ + satu cabang di `recipes.execute()`.
   terhapus. Nilai retensi tak sah (`0`, negatif, bukan angka) kembali ke default.
 - **Gate notifikasi:** hanya kirim kalau ada berkas yang benar-benar dihapus.
 
+### `ekin_harian` — Aktivitas Harian e-Kinerja
+- **Jadwal:** `0 7,16 * * *` (07:00 sebelum jam kerja, 16:00 sesudah 15:00)
+- **Input:** tidak ada — satu tombol saja.
+- **Akun:** `199303252025061002` (env `EKIN_BW_USERNAME`), kredensial dari
+  Bitwarden item `simpatik.semarangkota.go.id`, **wajib** pakai `username=`
+  karena item itu dipakai beberapa akun sekaligus.
+- **Langkah:** login SIMPATIK → `token?app=ekinv3` → sapu
+  `/administrator/aktivitas_harian` → simpan ke `ekin_aktivitas` → laporkan.
+- **Tidak ada total per hari di e-kin.** Halaman hanya 10 baris per halaman;
+  panel kalender (`/per_kalender*`) cuma memuat judul kegiatan; grafik
+  Highcharts hanya akumulasi **bulanan**. Jadi total harian dijumlah sendiri
+  dari baris tersimpan — itu alasan tabel SQL-nya ada.
+- **Paginasi:** `/index/{offset}`, offset = (halaman−1)×10. Tautan "Last"
+  memakai offset yang sama. Jangan pakai "Next" (di halaman akhir menunjuk
+  dirinya sendiri). Sapuan berhenti saat satu halaman seluruhnya lebih tua
+  dari batas yang diminta.
+- **Kolom tabel:** checkbox id → tanggal → uraian → (satuan|kuantitas|waktu)
+  → status → aksi. `waktu` **tidak selalu** satuan × kuantitas (240×2 bisa
+  tercatat 390 menit karena e-kin memotong), jadi angkanya dibaca apa adanya.
+- **Batas penilaian bergeser mengikuti jam** (`batas_periksa()`): sebelum
+  15:00 hanya sampai kemarin, sesudahnya termasuk hari ini. Alasannya input
+  e-kin memang hanya bisa sebelum 08:00 / sesudah 15:00.
+- **Target:** 420 menit/hari dianggap cukup; kurang dari itu dilaporkan
+  beserta selisihnya. Minimum bulanan 8.000 menit dilaporkan sebagai progres.
+- **Hari kerja** = Senin–Jumat. Hari libur nasional tidak bisa ditebak dari
+  e-kin (sama seperti hari kosong), jadi diisi manual lewat `EKIN_HARI_LIBUR`.
+- **Idempoten:** penyimpanan mengganti rentang tanggal yang disapu
+  (`DELETE ... BETWEEN` lalu insert), jadi run beruntun tidak menggandakan.
+  Riwayat bulan sebelumnya tetap tersimpan.
+- **Gate notifikasi:** hanya kirim kalau ada hari kosong atau di bawah 420
+  menit — alur ini jalan 2× sehari.
+- **Tab Kinerja di dashboard** menampilkan hari kerja bulan ini yang belum
+  memenuhi target, dengan form isian multi-baris per tanggal (butir kegiatan,
+  catatan, kuantitas) — pengganti antrian riwayat di extension browser.
+  Isian disimpan di `ekin_rencana`; tabel ini sengaja terpisah dari
+  `ekin_aktivitas` karena isian belum tentu sudah masuk e-kin.
+- **Isian tidak langsung dikirim.** Tab Kinerja hanya menaruh isian di antrian
+  (`ekin_rencana.status = pending`); pengiriman ke SIMPATIK dilakukan alur
+  `ekin_kirim` yang jalan jam 15.00, atau tombol "Kirim ke SIMPATIK" saat
+  jendela input e-kin terbuka (sebelum 08.00 / sesudah 15.00). Di luar jendela
+  itu tombol menolak — server e-kin yang menolak, bukan pilihan kita.
+- **Status kirim per baris:** `pending` (menunggu) → `sent` (terbukti ada di
+  tabel e-kin) atau `error` (ditolak/ditolak-tak-terlihat). Status ditentukan
+  dengan menyapu ulang tabel e-kin setelah kirim, jadi run beruntun tidak
+  menggandakan data. Menyimpan ulang tanggal mempertahankan status baris yang
+  isinya tidak berubah.
+- **Urutan isi form e-kin yang benar** (kalau tidak, `waktu` bisa 0): pilih
+  tanggal → pilih butir → tunggu `#satuan_waktu` terisi (AJAX
+  `get_detail_butir_kegiatan`) → ketik kuantitas → tunggu
+  `#waktu == kuantitas × satuan_waktu` → klik `.btn_save[data-stype="stay"]`.
+
+### `ekin_kirim` — Kirim Isian e-Kinerja ke SIMPATIK
+- **Jadwal:** `0 15 * * *` (sesudah jam 15.00, saat e-kin menerima input).
+- **Input:** tidak ada.
+- **Langkah:** ambil `ekin_rencana` berstatus `pending` → login SIMPATIK →
+  isi `/aktivitas_harian/add_new` per butir → sapu ulang tabel → tandai
+  `sent` yang benar-benar muncul, `error` untuk sisanya.
+- **Butir dicari lewat** `GET /administrator/aktivitas_harian/get_butir_kegiatan?search=<nama>`,
+  dicocokkan **persis** (titik, huruf besar-kecil, spasi diabaikan) lalu
+  diambil id pertama. Nama yang tidak ada di e-kin tidak dikirim.
+- **Satuan menit diambil dari e-kin**, bukan dari katalog lokal: server
+  mengisi `#satuan_waktu` lewat `get_detail_butir_kegiatan`.
+- **Gate notifikasi:** diam kalau tidak ada yang dikirim dan tidak ada gagal.
+
+### `absen_cek` — Cek Presensi Harian (absen.semarangkota.go.id)
+- **Jadwal:** `50,55 7 * * 1-5` (hadir) dan `1,6 16 * * 1-5` (pulang) — lihat
+  `schedule_extra`; satu ekspresi cron tidak bisa memuat dua jendela berbeda.
+- **Input:** `sesi_shift` opsional (`hadir`/`pulang`); kosong = ditentukan jam.
+- **BACA SAJA.** Tidak pernah mengisi atau menghapus presensi. Endpoint yang
+  dipakai hanya `/home`, `/presensi/rekap-harian`,
+  `/presensi/rekap-harian/asn/<kode>`, `/web-service/get-jam-kerja` (query),
+  dan `/web-service/list-pegawai-asn-all-harian`. Jangan menambah panggilan ke
+  tombol/endpoint KONFIRMASI, simpan, atau hapus.
+- **Target tetap satu orang:** NIP `199303252025061002` (Riyanto Nugroho) lewat
+  env `ABSEN_NIP`. Kalau NIP tidak ada di rekap, alur **gagal** — tidak pernah
+  jatuh ke "laporkan semua pegawai".
+- **Captcha dijawab manusia lewat Telegram.** Tanpa OCR, tanpa browser. Bot
+  mengirim gambar, user membalas kodenya. Sesi disimpan di
+  `data/absen_session.json`; selama sesi hidup tidak ada captcha sama sekali.
+- **Bot Telegram satu-satunya pembaca `getUpdates`.** Resep menunggu jawaban
+  lewat tabel `notes` (`absen_captcha_jawaban`). Kalau resep ikut polling,
+  keduanya berebut pesan yang sama dan balasan captcha bisa hilang.
+- **Kredensial dicari lewat NAMA item persis** (`bw get item
+  absen.semarangkota.go.id`), bukan username. Username
+  `dpmptsp@semarangkota.go.id` dipakai lima item berbeda; mencari lewat
+  username pernah memilih `sisdmk.kemkes.go.id` dan login selalu ditolak
+  dengan pesan "Username, Password atau Captcha Tidak Sesuai" — pesan itu
+  menyembunyikan penyebab sebenarnya.
+- **Situs ini Laravel**, bukan CodeIgniter: token CSRF ada di `var token = "..."`
+  dalam halaman; POST tanpa token dijawab `419 CSRF token mismatch`. Captcha
+  terikat `laravel_session`, jadi gambar dan POST wajib satu sesi.
+- **Gate notifikasi:** diam kalau target sudah absen. Jadwalnya dua kali
+  beruntun (07:50 & 07:55), jadi tanpa gate ini selalu dobel.
+- **Cara pakai manual:** kirim `/absen` atau `/absen pulang` ke bot.
+
 ---
 
 ## Notifikasi Telegram
@@ -201,6 +299,8 @@ jalur exception, agar kegagalan tidak senyap.
 | DUK tersimpan (batch baru) | ✅ |
 | Pegawai terimpor | ✅ (resume: jumlah + PNS/PPPK) |
 | Pembersihan 0 berkas | ❌ diam |
+| e-Kinerja ada hari kosong/kurang | ✅ |
+| e-Kinerja semua hari memenuhi target | ❌ diam |
 
 Penomoran jalan 12× sehari — tanpa gate ini akan jadi noise.
 
@@ -219,12 +319,13 @@ Kegagalan kirim/pencatatan **tidak boleh** menggagalkan recipe.
 ## Dashboard (`python -m hermes web`)
 
 Port default 10000, Basic Auth dari Docker secret `secrets/web_pass`
-(bukan `.env`). Empat tab:
+(bukan `.env`). Lima tab:
 
 | Tab | Isi |
 |---|---|
 | **Dashboard** | kartu statistik, "Notifikasi terakhir" (3 pesan), grafik 7 hari, kesehatan |
 | **Alur** | daftar recipe: jadwal, status, tombol Jalankan, hasil terakhir, "lihat log" |
+| **Kinerja** | hari kerja bulan ini yang belum terisi + form isian butir per tanggal |
 | **Notifikasi** | semua pesan Telegram yang benar-benar terkirim + waktunya |
 | **Log** | log aktivitas, filter level, export `.txt` |
 
@@ -233,9 +334,13 @@ Endpoint:
 ```
 GET  /                    halaman SPA
 GET  /api/dashboard       stats + recipes + notifications (30 terakhir)
+GET  /api/kinerja         ringkasan e-kin + hari belum terisi + butir + isian
 GET  /api/notifications   pesan Telegram (200 terakhir)
 GET  /api/logs[?level=]   log; ?format=txt untuk unduh
-POST /api/recipes/<key>/run   jalankan alur (body: {"inputs": {...}})
+POST /api/recipes/<key>/run        jalankan alur (body: {"inputs": {...}})
+POST /api/kinerja/isian            ganti isian satu tanggal (body: {tanggal, baris})
+POST /api/kinerja/isian/<tgl>/hapus
+POST /api/kinerja/kirim            kirim antrian ke SIMPATIK (body: {paksa?})
 ```
 
 Auto-refresh 15 detik hanya saat tab Dashboard aktif.
@@ -257,7 +362,7 @@ Auto-refresh 15 detik hanya saat tab Dashboard aktif.
 
 | Path | Isi |
 |---|---|
-| `data/hermes.sqlite` | DB utama: `notes`, `records`, `logs`, `recipe_state` |
+| `data/hermes.sqlite` | DB utama: `notes`, `records`, `logs`, `recipe_state`, `ekin_aktivitas`, `ekin_rencana` |
 | `data/magang_seen.json` | kode `MGNG-*` yang sudah dilaporkan |
 | `data/bw-config/` | config & login Bitwarden antar-restart |
 | `output/ecuti/` | Excel hasil export |
@@ -279,6 +384,10 @@ TELEGRAM_ALLOWED_CHAT_IDS              daftar chat id (diparse jadi int!)
 TELEGRAM_NOTIFY                        kill switch (0 = mati)
 PENOMORAN_MAX_HALAMAN                  default 3
 HERMES_OUTPUT_RETENSI_HARI             default 7 (resep bersih_output)
+EKIN_BW_USERNAME                       akun e-kin (default 199303252025061002)
+EKIN_TARGET_HARIAN / EKIN_TARGET_BULANAN   default 420 / 8000 menit
+EKIN_HARI_LIBUR                        tanggal libur, dipisah koma
+EKIN_BULAN_KE_BELAKANG / EKIN_MAX_HALAMAN  batas sapuan tabel e-kin
 KEPEG_API_KEY / GOOGLE_SHEET_ID        akses API & register
 BW_EMAIL                               untuk `bw login` di entrypoint
 HERMES_DAILY_DELAY                     jeda startup autopilot (detik)
@@ -343,6 +452,11 @@ pemakaian `bw` harus berada dalam satu proses Python yang sama.
 9. **Resep harus idempoten.** Run beruntun tidak boleh menggandakan hasil.
 10. **Pollusi state dari uji coba.** Menjalankan recipe dengan `execute` palsu
     tetap mencatat `recipe_state`; reset state sebelum verifikasi akhir.
+11. **Total harian e-kin dijumlah sendiri.** Halaman, kalender, dan grafik
+    tidak ada yang memberi total per hari — grafik hanya akumulasi bulanan,
+    kalender hanya judul kegiatan. Jangan coba menebak dari kalender.
+12. **`waktu` e-kin dibaca apa adanya.** Satuan × kuantitas sering tidak sama
+    dengan menit tercatat (e-kin memotong), jadi jangan dihitung ulang.
 
 ---
 
